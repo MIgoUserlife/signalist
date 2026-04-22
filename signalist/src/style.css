@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+@theme {
+  --color-glass-bg: rgba(30, 30, 46, 0.72);
+  --color-glass-border: rgba(88, 91, 112, 0.45);
+  --color-surface: #181825;
+  --color-surface-hover: #313244;
+  --color-surface-active: #45475a;
+  --color-text-primary: #cdd6f4;
+  --color-text-muted: #a6adc8;
+  --color-accent: #89b4fa;
+  --color-badge-bg: #f38ba8;
+  --color-badge-text: #11111b;
+  --color-brand-purple: #7c3aed;
+  --color-brand-blue: #2563eb;
+}
+
+html,
+body,
+#app {
+  height: 100vh;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background-color: var(--color-surface);
+  color: var(--color-text-primary);
+}
+
+@supports (backdrop-filter: blur(20px)) {
+  .glass {
+    background: var(--color-glass-bg);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+  }
+}

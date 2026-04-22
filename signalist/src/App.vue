@@ -1,19 +1,25 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, reactive } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { MessageCircle, Send, Settings } from "lucide-vue-next";
 
 const activeMessenger = ref("telegram");
 
 interface MessengerConfig {
   label: string;
   displayName: string;
-  icon: string;
+  icon: typeof Send;
 }
 
 const messengers: MessengerConfig[] = [
-  { label: "telegram", displayName: "Telegram", icon: "✈️" },
-  { label: "whatsapp", displayName: "WhatsApp", icon: "💬" },
+  { label: "telegram", displayName: "Telegram", icon: Send },
+  { label: "whatsapp", displayName: "WhatsApp", icon: MessageCircle },
 ];
+
+const unreadCounts = reactive<Record<string, number>>({
+  telegram: 3,
+  whatsapp: 0,
+});
 
 async function openMessenger(label: string) {
   try {
@@ -38,109 +44,48 @@ openMessenger("telegram");
 </script>
 
 <template>
-  <nav class="sidebar">
-    <div class="sidebar-brand">S</div>
-    <div class="sidebar-messengers">
+  <nav
+    class="glass fixed top-0 left-0 z-50 flex h-screen w-[72px] flex-col items-center border-r border-glass-border pt-3 select-none"
+  >
+    <div
+      class="mb-5 flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-brand-purple to-brand-blue text-xl font-bold text-white"
+    >
+      S
+    </div>
+
+    <div class="flex w-full flex-col gap-2 px-2">
+      <div v-for="m in messengers" :key="m.label" class="relative">
+        <button
+          :class="[
+            'group flex h-14 w-14 items-center justify-center rounded-2xl border-none bg-transparent cursor-pointer transition-all duration-150',
+            activeMessenger === m.label
+              ? 'bg-surface-active text-accent shadow-[inset_3px_0_0_var(--color-accent)]'
+              : 'text-text-muted hover:bg-surface-hover hover:text-text-primary',
+          ]"
+          :title="m.displayName"
+          @click="switchMessenger(m.label)"
+        >
+          <component :is="m.icon" :size="26" :stroke-width="1.8" />
+        </button>
+
+        <span
+          v-if="unreadCounts[m.label] > 0"
+          class="absolute top-0.5 right-0.5 flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-badge-bg px-1 text-[11px] font-semibold leading-none text-badge-text"
+        >
+          {{ unreadCounts[m.label] > 99 ? "99+" : unreadCounts[m.label] }}
+        </span>
+      </div>
+    </div>
+
+    <div class="mt-auto mb-4">
       <button
-        v-for="m in messengers"
-        :key="m.label"
-        :class="['sidebar-btn', { active: activeMessenger === m.label }]"
-        :title="m.displayName"
-        @click="switchMessenger(m.label)"
+        class="flex h-10 w-10 items-center justify-center rounded-xl border-none bg-transparent text-text-muted transition-colors duration-150 hover:bg-surface-hover hover:text-text-primary cursor-pointer"
+        title="Settings"
       >
-        <span class="sidebar-icon">{{ m.icon }}</span>
+        <Settings :size="20" :stroke-width="1.8" />
       </button>
     </div>
   </nav>
+
+  <main class="ml-[72px] h-screen" />
 </template>
-
-<style>
-:root {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  font-size: 14px;
-  line-height: 1.5;
-  color: #e0e0e0;
-  background-color: #1e1e2e;
-  margin: 0;
-  padding: 0;
-  height: 100vh;
-  overflow: hidden;
-}
-
-html, body, #app {
-  height: 100vh;
-  margin: 0;
-  padding: 0;
-  overflow: hidden;
-}
-
-.sidebar {
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 72px;
-  height: 100vh;
-  background-color: #181825;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding-top: 12px;
-  z-index: 9999;
-  -webkit-user-select: none;
-  user-select: none;
-  border-right: 1px solid #313244;
-}
-
-.sidebar-brand {
-  width: 40px;
-  height: 40px;
-  border-radius: 12px;
-  background: linear-gradient(135deg, #7c3aed, #2563eb);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 20px;
-  font-weight: 700;
-  color: #fff;
-  margin-bottom: 20px;
-}
-
-.sidebar-messengers {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  width: 100%;
-  padding: 0 8px;
-  box-sizing: border-box;
-}
-
-.sidebar-btn {
-  width: 56px;
-  height: 56px;
-  border-radius: 16px;
-  border: none;
-  background: transparent;
-  color: #a6adc8;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: background 0.15s, color 0.15s;
-  font-size: 24px;
-}
-
-.sidebar-btn:hover {
-  background: #313244;
-  color: #cdd6f4;
-}
-
-.sidebar-btn.active {
-  background: #45475a;
-  color: #89b4fa;
-  box-shadow: inset 3px 0 0 #89b4fa;
-}
-
-.sidebar-icon {
-  line-height: 1;
-}
-</style>
