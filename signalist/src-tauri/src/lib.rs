@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Mutex;
 use tauri::{
     webview::WebviewBuilder, AppHandle, LogicalPosition, LogicalSize, Manager, RunEvent,
@@ -38,6 +39,18 @@ const MESSENGERS: &[Messenger] = &[
 ];
 
 pub struct ActiveMessenger(pub Mutex<String>);
+
+#[derive(Default)]
+pub struct UnreadCounts(pub Mutex<HashMap<String, u32>>);
+
+#[tauri::command]
+fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
+    println!("[Signalist] {} unread: {}", messenger, count);
+    if let Some(state) = app.try_state::<UnreadCounts>() {
+        let mut map = state.0.lock().unwrap();
+        map.insert(messenger, count);
+    }
+}
 
 fn get_logical_size(window: &tauri::Window) -> Result<LogicalSize<f64>, String> {
     let physical = window.inner_size().map_err(|e| e.to_string())?;
@@ -108,11 +121,18 @@ async fn open_messenger(app: AppHandle, messenger: String) -> Result<String, Str
 
     let parsed_url: tauri::Url = config.url.parse().map_err(|e| format!("{}", e))?;
 
+    let init_script = match config.label {
+        "telegram" => include_str!("../inject/telegram.js"),
+        "whatsapp" => include_str!("../inject/whatsapp.js"),
+        _ => "",
+    };
+
     let webview_builder = WebviewBuilder::new(config.label, WebviewUrl::External(parsed_url))
         .user_agent(CHROME_UA)
         .data_store_identifier(config.data_store_id)
         .on_navigation(nav_guard)
-        .devtools(true);
+        .devtools(true)
+        .initialization_script(init_script);
 
     hide_all_messengers(&app);
 
@@ -192,11 +212,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .manage(ActiveMessenger(Mutex::new(String::new())))
+        .manage(UnreadCounts::default())
         .invoke_handler(tauri::generate_handler![
             open_messenger,
             switch_messenger,
             close_messenger,
             get_active_messenger,
+            update_unread_count,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
