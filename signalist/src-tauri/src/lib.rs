@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
+use serde::Serialize;
 use tauri::{
-    webview::WebviewBuilder, AppHandle, LogicalPosition, LogicalSize, Manager, RunEvent,
-    WebviewUrl, WindowBuilder, WindowEvent,
+    webview::WebviewBuilder, AppHandle, Emitter, LogicalPosition, LogicalSize, Manager,
+    RunEvent, WebviewUrl, WindowBuilder, WindowEvent,
 };
 
 const SIDEBAR_WIDTH: f64 = 72.0;
@@ -43,13 +44,20 @@ pub struct ActiveMessenger(pub Mutex<String>);
 #[derive(Default)]
 pub struct UnreadCounts(pub Mutex<HashMap<String, u32>>);
 
+#[derive(Clone, Serialize)]
+struct UnreadUpdatePayload {
+    messenger: String,
+    count: u32,
+}
+
 #[tauri::command]
 fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
     println!("[Signalist] {} unread: {}", messenger, count);
     if let Some(state) = app.try_state::<UnreadCounts>() {
         let mut map = state.0.lock().unwrap();
-        map.insert(messenger, count);
+        map.insert(messenger.clone(), count);
     }
+    let _ = app.emit("unread-update", UnreadUpdatePayload { messenger, count });
 }
 
 fn get_logical_size(window: &tauri::Window) -> Result<LogicalSize<f64>, String> {

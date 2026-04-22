@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, reactive } from "vue";
+import { ref, reactive, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { MessageCircle, Send, Settings } from "lucide-vue-next";
 
 const activeMessenger = ref("telegram");
@@ -17,8 +18,23 @@ const messengers: MessengerConfig[] = [
 ];
 
 const unreadCounts = reactive<Record<string, number>>({
-  telegram: 3,
+  telegram: 0,
   whatsapp: 0,
+});
+
+let unlisten: UnlistenFn | null = null;
+
+onMounted(async () => {
+  unlisten = await listen<{ messenger: string; count: number }>(
+    "unread-update",
+    (event) => {
+      unreadCounts[event.payload.messenger] = event.payload.count;
+    },
+  );
+});
+
+onUnmounted(() => {
+  unlisten?.();
 });
 
 async function openMessenger(label: string) {
@@ -31,6 +47,7 @@ async function openMessenger(label: string) {
 }
 
 async function switchMessenger(label: string) {
+  unreadCounts[label] = 0;
   try {
     await invoke("switch_messenger", { messenger: label });
     activeMessenger.value = label;
