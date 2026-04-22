@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Signalist",
+  "version": "0.1.0",
+  "identifier": "com.signalist.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Signalist",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true,
+        "create": false
+      }
+    ],
+    "security": {
+      "csp": {
+        "default-src": "'self' customprotocol: asset: tauri:",
+        "connect-src": "ipc: http://ipc.localhost https://web.telegram.org https://web.whatsapp.com",
+        "img-src": "'self' asset: http://asset.localhost blob: data: https://web.telegram.org https://web.whatsapp.com",
+        "style-src": "'unsafe-inline' 'self'",
+        "script-src": "'self'",
+        "font-src": "https://fonts.gstatic.com https://web.telegram.org https://web.whatsapp.com",
+        "media-src": "blob: https://web.telegram.org https://web.whatsapp.com",
+        "worker-src": "'self' blob:"
+      },
+      "capabilities": ["default"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
