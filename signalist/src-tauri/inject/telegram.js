@@ -1,49 +1,95 @@
 (function () {
   'use strict';
 
+  // --- Constants ---
   const MESSENGER = 'telegram';
+  const DEBOUNCE_MS = 300;
+  const MAX_DELAY_MS = 2000;
+
+  // --- Mutable state (MUST be declared before any function that reads them is CALLED) ---
+  let _pendingCount = null;
+  let _pollTimer = null;
+  let _debounceTimer = null;
+  let _lastFireTime = Date.now();
   let lastCount = -1;
 
-  function invokeTauri(count) {
-    if (typeof window.__TAURI__ !== 'undefined' && window.__TAURI__.invoke) {
-      try {
-        window.__TAURI__.invoke('update_unread_count', {
-          messenger: MESSENGER,
-          count: count,
-        });
-      } catch (e) {
-        console.error('[Signalist Inject] Tauri invoke failed:', e);
+  // --- Function declarations (hoisted, safe to reference) ---
+  function resolveInvoke() {
+    if (window.__TAURI_INTERNALS__ && typeof window.__TAURI_INTERNALS__.invoke === 'function') {
+      return window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__);
+    }
+    if (window.__TAURI__) {
+      if (window.__TAURI__.core && typeof window.__TAURI__.core.invoke === 'function') {
+        return window.__TAURI__.core.invoke.bind(window.__TAURI__.core);
+      }
+      if (typeof window.__TAURI__.invoke === 'function') {
+        return window.__TAURI__.invoke.bind(window.__TAURI__);
       }
     }
+    return null;
+  }
+
+  function tryFlush() {
+    const invoke = resolveInvoke();
+    if (!invoke) return false;
+    if (_pendingCount === null) return true;
+    const c = _pendingCount;
+    _pendingCount = null;
+    try {
+      const p = invoke('update_unread_count', { messenger: MESSENGER, count: c });
+      if (p && typeof p.then === 'function') {
+        p.then(
+          function () {},
+          function (e) { console.error('[Signalist Inject] invoke FAILED for', MESSENGER, e); }
+        );
+      }
+    } catch (e) {
+      console.error('[Signalist Inject] Tauri invoke threw:', e);
+    }
+    return true;
+  }
+
+  function invokeTauri(count) {
+    _pendingCount = count; // always overwrite — we only care about the latest value
+    if (tryFlush()) return;
+    // internals not ready yet — start polling
+    if (_pollTimer) return;
+    _pollTimer = setInterval(function () {
+      if (tryFlush()) {
+        clearInterval(_pollTimer);
+        _pollTimer = null;
+      }
+    }, 200);
   }
 
   function getTitleCount() {
-    const match = document.title.match(/^\(([\d\s,]+)\)\s*[^\)]*$/);
+    const match = document.title.match(/^\(([\d\s,+]+)\)\s*[^\)]*$/);
     if (match) {
-      const num = parseInt(match[1].replace(/[\s,]/g, ''), 10);
+      const num = parseInt(match[1].replace(/[\s,+]/g, ''), 10);
       return isNaN(num) ? 0 : num;
     }
     return 0;
   }
 
   function getDomCount() {
+    const seen = new Set();
     let total = 0;
+    // All selectors that can match unread badges in Telegram Web.
+    // Folder/tab badges are filtered out by the node.closest() check below.
     const selectors = [
+      // Telegram Web A (current) — stable classes only
+      '.ListItem.Chat .chat-badge-transition.shown span',
+      '.chat-list .chat-badge-transition.shown span',
+      // Backward compat for older K version
       '.chat-list-item .badge',
-      '.chat-list-item .DialogBadge',
-      '.chat-list-item [class*="Badge"]',
-      '.chat-list-item [class*="badge"]',
-      '.chat-list-item .rp',
-      '.chat-list [class*="unread"]',
-      '.Transition_slide-active [class*="badge"]',
-      '.Transition_slide-active [class*="Badge"]',
-      '.sidebar [class*="badge"]',
-      '.sidebar [class*="Badge"]',
+      '.ListItem .chat-badge-transition span',
     ];
 
     for (const selector of selectors) {
       const nodes = document.querySelectorAll(selector);
       for (const node of nodes) {
+        if (seen.has(node)) continue;
+        seen.add(node);
         const text = (node.textContent || '').trim();
         if (/^\d+$/.test(text)) {
           const num = parseInt(text, 10);
@@ -74,33 +120,52 @@
     }
   }
 
+  function debouncedCheckAndUpdate() {
+    clearTimeout(_debounceTimer);
+    const now = Date.now();
+    const elapsed = now - _lastFireTime;
+
+    if (elapsed >= MAX_DELAY_MS) {
+      // Max delay exceeded — fire immediately
+      checkAndUpdate();
+      _lastFireTime = Date.now();
+    } else {
+      const delay = Math.min(DEBOUNCE_MS, MAX_DELAY_MS - elapsed);
+      _debounceTimer = setTimeout(() => {
+        checkAndUpdate();
+        _lastFireTime = Date.now();
+      }, delay);
+    }
+  }
+
   function setupObservers() {
     // 1. Observe <title> for SPA title changes.
     const titleEl = document.querySelector('title');
     if (titleEl) {
-      new MutationObserver(checkAndUpdate).observe(titleEl, {
+      new MutationObserver(debouncedCheckAndUpdate).observe(titleEl, {
         childList: true,
       });
     }
 
     // 2. Observe chat-list containers for badge mutations.
     const chatListSelectors = [
-      '.chat-list',
-      '.Transition_slide-active.left-column',
+      '#LeftColumn',             // Telegram Web A - stable ID
+      '.chat-list',              // Current active chat-list
+      '.left-column',
       '.Transition_slide-active',
       '.sidebar',
-      '[class*="chat-list"]',
     ];
 
     function observeChatList() {
       for (const sel of chatListSelectors) {
         const el = document.querySelector(sel);
         if (el) {
-          new MutationObserver(checkAndUpdate).observe(el, {
+          new MutationObserver(debouncedCheckAndUpdate).observe(el, {
             childList: true,
             subtree: true,
             attributes: true,
-            attributeFilter: ['class', 'data-id'],
+            attributeFilter: ['class', 'data-id', 'aria-label'],
+            characterData: true,
           });
           return true;
         }
@@ -119,22 +184,58 @@
 
     // 3. Observe body class changes (sidebar visibility toggles).
     try {
-      new MutationObserver(checkAndUpdate).observe(document.body, {
+      new MutationObserver(debouncedCheckAndUpdate).observe(document.body, {
         attributes: true,
         attributeFilter: ['class'],
       });
     } catch (e) {
       /* ignore */
     }
+
+    // 4. Safety net: re-check every 5s regardless of mutations — debounce coalesces rapid calls
+    setInterval(debouncedCheckAndUpdate, 5000);
   }
 
+  // --- Fetch patch (Tauri #15216 workaround) ---
+  // Strict CSPs on web.telegram.org block fetch("ipc://...") at a level that
+  // never propagates into JS rejection handlers, so Tauri's fetch-first IPC
+  // hangs forever and never falls back to window.ipc.postMessage.
+  // Intercepting fetch and immediately rejecting ipc:// URLs forces Tauri's
+  // own fallback path (postMessage), which works reliably through the CSP.
+  // Triple-layer patch: window.fetch assignment + Object.defineProperty + globalThis.fetch
+  (function patchFetch() {
+    const _origFetch = window.fetch.bind(window);
+    const patched = function(url) {
+      let urlStr = '';
+      try {
+        if (typeof url === 'string') urlStr = url;
+        else if (url instanceof URL) urlStr = url.href;
+        else if (url && typeof url.url === 'string') urlStr = url.url; // Request
+      } catch (_e) {}
+      if (urlStr.indexOf('ipc://') === 0 || urlStr.indexOf('http://ipc.localhost') === 0) {
+        return Promise.reject(new TypeError('[Signalist] fetch(ipc://) forced-reject (Tauri #15216 workaround)'));
+      }
+      return _origFetch.apply(this, arguments);
+    };
+    try { window.fetch = patched; } catch (_e) {}
+    try { Object.defineProperty(window, 'fetch', { value: patched, writable: true, configurable: true }); } catch (_e) {}
+    try { globalThis.fetch = patched; } catch (_e) {}
+    console.log('[Signalist Inject] ' + MESSENGER + ' fetch() patched (Tauri #15216 workaround)');
+  })();
+
+  // --- Startup logging ---
+  console.log('[Signalist Inject] ' + MESSENGER + '.js loaded, TAURI_INTERNALS at load:', !!window.__TAURI_INTERNALS__);
+
+  // --- Normal observers + initial check ---
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
       setupObservers();
       setTimeout(checkAndUpdate, 500);
+      setTimeout(debouncedCheckAndUpdate, 3000);
     });
   } else {
     setupObservers();
     setTimeout(checkAndUpdate, 500);
+    setTimeout(debouncedCheckAndUpdate, 3000);
   }
 })();

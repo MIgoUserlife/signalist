@@ -1,0 +1,11 @@
+"$schema" = "../gen/schemas/schema.json"
+
+[[permission]]
+identifier = "allow-messenger-commands"
+description = "Allows the sidebar to open, switch, close, and query messenger webviews."
+commands.allow = [
+  "open_messenger",
+  "switch_messenger",
+  "close_messenger",
+  "get_active_messenger",
+]

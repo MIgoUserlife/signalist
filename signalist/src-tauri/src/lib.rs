@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use serde::Serialize;
 use tauri::{
+    path::BaseDirectory,
     webview::WebviewBuilder, AppHandle, Emitter, LogicalPosition, LogicalSize, Manager,
     RunEvent, WebviewUrl, WindowBuilder, WindowEvent,
 };
+use tauri_plugin_notification::NotificationExt;
 
 const SIDEBAR_WIDTH: f64 = 72.0;
 
@@ -44,6 +47,12 @@ pub struct ActiveMessenger(pub Mutex<String>);
 #[derive(Default)]
 pub struct UnreadCounts(pub Mutex<HashMap<String, u32>>);
 
+#[derive(Default)]
+pub struct LastNotified {
+    pub counts: Mutex<HashMap<String, u32>>,
+    pub timestamps: Mutex<HashMap<String, Instant>>,
+}
+
 #[derive(Clone, Serialize)]
 struct UnreadUpdatePayload {
     messenger: String,
@@ -52,12 +61,85 @@ struct UnreadUpdatePayload {
 
 #[tauri::command]
 fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
-    println!("[Signalist] {} unread: {}", messenger, count);
+    // Validate messenger label — reject arbitrary strings
+    const ALLOWED: &[&str] = &["telegram", "whatsapp"];
+    if !ALLOWED.contains(&messenger.as_str()) {
+        eprintln!("[Signalist] update_unread_count REJECTED unknown messenger: {}", messenger);
+        return;
+    }
+    // Clamp count to a sane maximum
+    let count = count.min(10_000);
+    #[cfg(debug_assertions)]
+    println!("[Signalist] update_unread_count CALLED for {} with count {}", messenger, count);
+
+    // Update UnreadCounts state (for sidebar badge consistency)
     if let Some(state) = app.try_state::<UnreadCounts>() {
         let mut map = state.0.lock().unwrap();
         map.insert(messenger.clone(), count);
     }
-    let _ = app.emit("unread-update", UnreadUpdatePayload { messenger, count });
+
+    // Emit event so sidebar updates badge
+    let _ = app.emit("unread-update", UnreadUpdatePayload { messenger: messenger.clone(), count });
+
+    // When count drops to 0, reset LastNotified baseline so future increases notify
+    if count == 0 {
+        if let Some(ln) = app.try_state::<LastNotified>() {
+            let mut counts = ln.counts.lock().unwrap();
+            counts.insert(messenger.clone(), 0);
+        }
+        return;
+    }
+
+    // Gate notification on LastNotified + cooldown
+    if let Some(ln) = app.try_state::<LastNotified>() {
+        let mut counts = ln.counts.lock().unwrap();
+        let mut timestamps = ln.timestamps.lock().unwrap();
+        let last_notified = counts.get(&messenger).copied().unwrap_or(0);
+        let cooldown_ok = match timestamps.get(&messenger) {
+            Some(last) => last.elapsed() >= Duration::from_secs(5),
+            None => true,
+        };
+
+        if count > last_notified && cooldown_ok {
+            let display_name = match messenger.as_str() {
+                "telegram" => "Telegram",
+                "whatsapp" => "WhatsApp",
+                _ => &messenger,
+            };
+            let body = if count == 1 {
+                "You have 1 unread message".to_string()
+            } else {
+                format!("You have {} unread messages", count)
+            };
+            // Resolve icon path for notification
+            let icon_path = app
+                .path()
+                .resolve("icons/icon.png", BaseDirectory::Resource)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            let mut builder = app
+                .notification()
+                .builder()
+                .title(format!("New message on {}", display_name))
+                .body(body);
+
+            if !icon_path.is_empty() {
+                builder = builder.icon(icon_path);
+            }
+
+            match builder.show() {
+                #[cfg(debug_assertions)]
+                Ok(()) => println!("[Signalist] Notification sent for {}", display_name),
+                #[cfg(not(debug_assertions))]
+                Ok(()) => {}
+                Err(e) => eprintln!("[Signalist] Notification failed for {}: {}", display_name, e),
+            }
+
+            counts.insert(messenger.clone(), count);
+            timestamps.insert(messenger.clone(), Instant::now());
+        }
+    }
 }
 
 fn get_logical_size(window: &tauri::Window) -> Result<LogicalSize<f64>, String> {
@@ -221,6 +303,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .manage(ActiveMessenger(Mutex::new(String::new())))
         .manage(UnreadCounts::default())
+        .manage(LastNotified::default())
         .invoke_handler(tauri::generate_handler![
             open_messenger,
             switch_messenger,
@@ -252,8 +335,8 @@ pub fn run() {
             )?;
 
             let open_handle = handle.clone();
-            std::thread::spawn(move || {
-                let _ = open_messenger(open_handle, "telegram".into());
+            tauri::async_runtime::spawn(async move {
+                let _ = open_messenger(open_handle, "telegram".into()).await;
             });
 
             window.on_window_event(move |event| {

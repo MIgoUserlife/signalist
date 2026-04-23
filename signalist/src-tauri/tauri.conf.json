@@ -36,12 +36,15 @@
         "media-src": "blob: https://web.telegram.org https://web.whatsapp.com",
         "worker-src": "'self' blob:"
       },
-      "capabilities": ["default"]
+      "capabilities": ["default", "messenger-ipc"]
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": [
+      "icons/icon.png"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -1,0 +1,6 @@
+"$schema" = "../gen/schemas/schema.json"
+
+[[permission]]
+identifier = "allow-update-unread-count"
+description = "Allows the update_unread_count command to report unread message counts from messenger webviews."
+commands.allow = ["update_unread_count"]

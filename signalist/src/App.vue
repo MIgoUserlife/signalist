@@ -2,6 +2,7 @@
 import { ref, reactive, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import { MessageCircle, Send, Settings } from "lucide-vue-next";
 
 const activeMessenger = ref("telegram");
@@ -25,6 +26,15 @@ const unreadCounts = reactive<Record<string, number>>({
 let unlisten: UnlistenFn | null = null;
 
 onMounted(async () => {
+  // Request notification permission if not already granted
+  try {
+    if (!(await isPermissionGranted())) {
+      await requestPermission();
+    }
+  } catch (e) {
+    console.warn("Notification permission request failed:", e);
+  }
+
   unlisten = await listen<{ messenger: string; count: number }>(
     "unread-update",
     (event) => {
@@ -70,24 +80,24 @@ openMessenger("telegram");
       S
     </div>
 
-    <div class="flex w-full flex-col gap-2 px-2">
+    <div class="flex w-full flex-col items-center gap-2 px-2">
       <div v-for="m in messengers" :key="m.label" class="relative">
         <button
           :class="[
-            'group flex h-14 w-14 items-center justify-center rounded-2xl border-none bg-transparent cursor-pointer transition-all duration-150',
+            'group flex h-12 w-12 items-center justify-center rounded-xl border-none cursor-pointer transition-all duration-150',
             activeMessenger === m.label
-              ? 'bg-surface-active text-accent shadow-[inset_3px_0_0_var(--color-accent)]'
+              ? 'bg-text-primary text-surface-hover'
               : 'text-text-muted hover:bg-surface-hover hover:text-text-primary',
           ]"
           :title="m.displayName"
           @click="switchMessenger(m.label)"
         >
-          <component :is="m.icon" :size="26" :stroke-width="1.8" />
+          <component :is="m.icon" :size="24" :stroke-width="2" />
         </button>
 
         <span
           v-if="unreadCounts[m.label] > 0"
-          class="absolute top-0.5 right-0.5 flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-badge-bg px-1 text-[11px] font-semibold leading-none text-badge-text"
+          class="absolute -top-1 -right-1 flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-badge-bg px-1 text-[11px] font-semibold leading-none text-badge-text"
         >
           {{ unreadCounts[m.label] > 99 ? "99+" : unreadCounts[m.label] }}
         </span>

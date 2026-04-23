@@ -1,8 +1,9 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default permissions for Signalist main window",
+  "description": "Default permissions for Signalist main window and sidebar webview",
   "windows": ["main"],
+  "webviews": ["sidebar"],
   "permissions": [
     "core:default",
     "core:window:default",
@@ -25,6 +26,7 @@
     "notification:default",
     "notification:allow-notify",
     "notification:allow-is-permission-granted",
-    "notification:allow-request-permission"
+    "notification:allow-request-permission",
+    "allow-messenger-commands"
   ]
 }
