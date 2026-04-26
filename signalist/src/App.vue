@@ -27,6 +27,8 @@ const currentHotkey = ref("Super+Shift+S");
 const isRecordingHotkey = ref(false);
 const hotkeyError = ref("");
 
+const autostartEnabled = ref(false);
+
 function formatHotkeyDisplay(hotkey: string): string {
   return hotkey
     .split("+")
@@ -73,6 +75,16 @@ function startRecordingHotkey() {
   window.addEventListener("keydown", captureHotkey, { once: true });
 }
 
+async function toggleAutostart() {
+  const next = !autostartEnabled.value;
+  try {
+    await invoke("set_autostart", { enable: next });
+    autostartEnabled.value = next;
+  } catch (e) {
+    console.error("Failed to toggle autostart:", e);
+  }
+}
+
 async function saveHotkey(shortcut: string) {
   isRecordingHotkey.value = false;
   try {
@@ -100,6 +112,12 @@ onMounted(async () => {
     currentHotkey.value = await invoke<string>("get_global_shortcut");
   } catch (e) {
     console.warn("Failed to load hotkey:", e);
+  }
+
+  try {
+    autostartEnabled.value = await invoke<boolean>("get_autostart");
+  } catch (e) {
+    console.warn("Failed to load autostart state:", e);
   }
 
   unlisten = await listen<{ messenger: string; count: number }>(
@@ -172,6 +190,21 @@ openMessenger("telegram");
     </div>
 
     <div class="mt-auto mb-4 flex flex-col items-center gap-1">
+      <button
+        class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"
+        :class="autostartEnabled
+          ? 'text-accent hover:bg-surface-hover'
+          : 'text-text-muted hover:bg-surface-hover hover:text-text-primary'"
+        :title="autostartEnabled ? 'Автозапуск увімкнено — натисніть, щоб вимкнути' : 'Автозапуск вимкнено — натисніть, щоб увімкнути'"
+        @click="toggleAutostart"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+        </svg>
+        <span class="text-[9px] leading-none opacity-70 select-none font-medium">
+          {{ autostartEnabled ? 'AUTO' : 'auto' }}
+        </span>
+      </button>
       <span v-if="hotkeyError" class="text-[8px] text-red-400 leading-none text-center px-1">{{ hotkeyError }}</span>
       <button
         class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"

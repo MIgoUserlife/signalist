@@ -10,6 +10,7 @@ use tauri::{
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_store::StoreExt;
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 const SIDEBAR_WIDTH: f64 = 72.0;
 
@@ -338,6 +339,21 @@ fn toggle_window(app: &AppHandle) {
 }
 
 #[tauri::command]
+fn get_autostart(app: AppHandle) -> bool {
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_autostart(app: AppHandle, enable: bool) -> Result<(), String> {
+    let autolaunch = app.autolaunch();
+    if enable {
+        autolaunch.enable().map_err(|e| e.to_string())
+    } else {
+        autolaunch.disable().map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
 fn get_global_shortcut(state: State<HotkeyConfig>) -> String {
     state.0.lock().unwrap().clone()
 }
@@ -371,6 +387,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
         .manage(ActiveMessenger(Mutex::new(String::new())))
         .manage(UnreadCounts::default())
         .manage(LastNotified::default())
@@ -383,6 +400,8 @@ pub fn run() {
             update_unread_count,
             get_global_shortcut,
             set_global_shortcut,
+            get_autostart,
+            set_autostart,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

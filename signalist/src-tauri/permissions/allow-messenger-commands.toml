@@ -8,4 +8,6 @@ commands.allow = [
   "switch_messenger",
   "close_messenger",
   "get_active_messenger",
+  "get_autostart",
+  "set_autostart",
 ]
