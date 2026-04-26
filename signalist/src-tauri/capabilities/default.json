@@ -27,6 +27,13 @@
     "notification:allow-notify",
     "notification:allow-is-permission-granted",
     "notification:allow-request-permission",
-    "allow-messenger-commands"
+    "allow-messenger-commands",
+    "global-shortcut:allow-register",
+    "global-shortcut:allow-unregister",
+    "global-shortcut:allow-is-registered",
+    "store:allow-get",
+    "store:allow-set",
+    "store:allow-save",
+    "store:allow-load"
   ]
 }

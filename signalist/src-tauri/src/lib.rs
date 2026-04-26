@@ -4,10 +4,12 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tauri::{
     path::BaseDirectory,
-    webview::WebviewBuilder, AppHandle, Emitter, LogicalPosition, LogicalSize, Manager,
+    webview::WebviewBuilder, AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, State,
     RunEvent, WebviewUrl, WindowBuilder, WindowEvent,
 };
 use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_store::StoreExt;
 
 const SIDEBAR_WIDTH: f64 = 72.0;
 
@@ -52,6 +54,8 @@ pub struct LastNotified {
     pub counts: Mutex<HashMap<String, u32>>,
     pub timestamps: Mutex<HashMap<String, Instant>>,
 }
+
+pub struct HotkeyConfig(pub Mutex<String>);
 
 #[derive(Clone, Serialize)]
 struct UnreadUpdatePayload {
@@ -312,19 +316,73 @@ fn hide_all_messengers(app: &AppHandle) {
     }
 }
 
+fn toggle_window(app: &AppHandle) {
+    let Some(window) = app.get_window("main") else { return };
+    let visible = window.is_visible().unwrap_or(false);
+    let focused = window.is_focused().unwrap_or(false);
+    if visible && focused {
+        let _ = window.hide();
+    } else if visible {
+        let _ = window.set_focus();
+    } else {
+        let _ = window.show();
+        let _ = window.set_focus();
+        let active = app.state::<ActiveMessenger>().0.lock().unwrap().clone();
+        if !active.is_empty() {
+            if let Some(webview) = app.get_webview(&active) {
+                let _ = webview.show();
+                let _ = webview.set_focus();
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn get_global_shortcut(state: State<HotkeyConfig>) -> String {
+    state.0.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn set_global_shortcut(
+    app: AppHandle,
+    state: State<HotkeyConfig>,
+    shortcut: String,
+) -> Result<(), String> {
+    let old = state.0.lock().unwrap().clone();
+    if !old.is_empty() {
+        let _ = app.global_shortcut().unregister(old.as_str());
+    }
+    app.global_shortcut()
+        .on_shortcut(shortcut.as_str(), |handle, _, event| {
+            if event.state() == ShortcutState::Pressed {
+                toggle_window(handle);
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    *state.0.lock().unwrap() = shortcut.clone();
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    store.set("hotkey", serde_json::Value::String(shortcut));
+    store.save().map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_store::Builder::default().build())
         .manage(ActiveMessenger(Mutex::new(String::new())))
         .manage(UnreadCounts::default())
         .manage(LastNotified::default())
+        .manage(HotkeyConfig(Mutex::new(String::new())))
         .invoke_handler(tauri::generate_handler![
             open_messenger,
             switch_messenger,
             close_messenger,
             get_active_messenger,
             update_unread_count,
+            get_global_shortcut,
+            set_global_shortcut,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -359,6 +417,22 @@ pub fn run() {
                     reposition_webviews(&resize_handle);
                 }
             });
+
+            let store = app.handle().store("settings.json")
+                .expect("Failed to open settings store");
+            let saved_hotkey = store
+                .get("hotkey")
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| "Super+Shift+S".to_string());
+            *app.state::<HotkeyConfig>().0.lock().unwrap() = saved_hotkey.clone();
+            app.handle()
+                .global_shortcut()
+                .on_shortcut(saved_hotkey.as_str(), |app_handle, _, event| {
+                    if event.state() == ShortcutState::Pressed {
+                        toggle_window(app_handle);
+                    }
+                })
+                .expect("Failed to register global shortcut");
 
             Ok(())
         })

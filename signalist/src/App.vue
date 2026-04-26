@@ -3,7 +3,7 @@ import { ref, reactive, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
-import { MessageCircle, Send, Settings } from "lucide-vue-next";
+import { MessageCircle, Send } from "lucide-vue-next";
 
 const activeMessenger = ref("telegram");
 
@@ -23,6 +23,67 @@ const unreadCounts = reactive<Record<string, number>>({
   whatsapp: 0,
 });
 
+const currentHotkey = ref("Super+Shift+S");
+const isRecordingHotkey = ref(false);
+const hotkeyError = ref("");
+
+function formatHotkeyDisplay(hotkey: string): string {
+  return hotkey
+    .split("+")
+    .map((part) => {
+      switch (part) {
+        case "Super": return "⌘";
+        case "Shift": return "⇧";
+        case "Alt": return "⌥";
+        case "Control": return "⌃";
+        case "Space": return "␣";
+        default: return part;
+      }
+    })
+    .join("");
+}
+
+function captureHotkey(e: KeyboardEvent) {
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.key === "Escape") {
+    isRecordingHotkey.value = false;
+    return;
+  }
+  const mods: string[] = [];
+  if (e.metaKey) mods.push("Super");
+  if (e.ctrlKey) mods.push("Control");
+  if (e.altKey) mods.push("Alt");
+  if (e.shiftKey) mods.push("Shift");
+  if (["Meta", "Control", "Alt", "Shift"].includes(e.key)) {
+    window.addEventListener("keydown", captureHotkey, { once: true });
+    return;
+  }
+  if (mods.length === 0) {
+    isRecordingHotkey.value = false;
+    return;
+  }
+  const key = e.key === " " ? "Space" : e.key.length === 1 ? e.key.toUpperCase() : e.key;
+  saveHotkey([...mods, key].join("+"));
+}
+
+function startRecordingHotkey() {
+  isRecordingHotkey.value = true;
+  hotkeyError.value = "";
+  window.addEventListener("keydown", captureHotkey, { once: true });
+}
+
+async function saveHotkey(shortcut: string) {
+  isRecordingHotkey.value = false;
+  try {
+    await invoke("set_global_shortcut", { shortcut });
+    currentHotkey.value = shortcut;
+  } catch (e) {
+    hotkeyError.value = "Failed to register";
+    setTimeout(() => { hotkeyError.value = ""; }, 2000);
+  }
+}
+
 let unlisten: UnlistenFn | null = null;
 
 onMounted(async () => {
@@ -33,6 +94,12 @@ onMounted(async () => {
     }
   } catch (e) {
     console.warn("Notification permission request failed:", e);
+  }
+
+  try {
+    currentHotkey.value = await invoke<string>("get_global_shortcut");
+  } catch (e) {
+    console.warn("Failed to load hotkey:", e);
   }
 
   unlisten = await listen<{ messenger: string; count: number }>(
@@ -104,12 +171,20 @@ openMessenger("telegram");
       </div>
     </div>
 
-    <div class="mt-auto mb-4">
+    <div class="mt-auto mb-4 flex flex-col items-center gap-1">
+      <span v-if="hotkeyError" class="text-[8px] text-red-400 leading-none text-center px-1">{{ hotkeyError }}</span>
       <button
-        class="flex h-10 w-10 items-center justify-center rounded-xl border-none bg-transparent text-text-muted transition-colors duration-150 hover:bg-surface-hover hover:text-text-primary cursor-pointer"
-        title="Settings"
+        class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"
+        :class="isRecordingHotkey
+          ? 'text-accent bg-surface-hover animate-pulse'
+          : 'text-text-muted hover:bg-surface-hover hover:text-text-primary'"
+        :title="isRecordingHotkey ? 'Press key combination (Esc to cancel)' : `Global hotkey: ${currentHotkey} — click to change`"
+        @click="isRecordingHotkey ? null : startRecordingHotkey()"
       >
-        <Settings :size="20" :stroke-width="1.8" />
+        <span class="text-base leading-none select-none">⌨</span>
+        <span class="text-[9px] leading-none opacity-70 select-none font-medium">
+          {{ isRecordingHotkey ? '···' : formatHotkeyDisplay(currentHotkey) }}
+        </span>
       </button>
     </div>
   </nav>
