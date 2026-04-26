@@ -26,3 +26,5 @@ dist-ssr
 # AI
 .opencode
 AGENTS.md
+.claude
+CLAUDE.md

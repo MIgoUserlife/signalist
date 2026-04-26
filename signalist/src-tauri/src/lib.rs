@@ -61,24 +61,22 @@ struct UnreadUpdatePayload {
 
 #[tauri::command]
 fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
-    // Validate messenger label — reject arbitrary strings
-    const ALLOWED: &[&str] = &["telegram", "whatsapp"];
-    if !ALLOWED.contains(&messenger.as_str()) {
+    if !MESSENGERS.iter().any(|m| m.label == messenger.as_str()) {
         eprintln!("[Signalist] update_unread_count REJECTED unknown messenger: {}", messenger);
         return;
     }
-    // Clamp count to a sane maximum
     let count = count.min(10_000);
     #[cfg(debug_assertions)]
     println!("[Signalist] update_unread_count CALLED for {} with count {}", messenger, count);
 
-    // Update UnreadCounts state (for sidebar badge consistency)
     if let Some(state) = app.try_state::<UnreadCounts>() {
         let mut map = state.0.lock().unwrap();
+        if map.get(&messenger).copied() == Some(count) {
+            return;
+        }
         map.insert(messenger.clone(), count);
     }
 
-    // Emit event so sidebar updates badge
     let _ = app.emit("unread-update", UnreadUpdatePayload { messenger: messenger.clone(), count });
 
     // When count drops to 0, reset LastNotified baseline so future increases notify
@@ -90,7 +88,6 @@ fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
         return;
     }
 
-    // Gate notification on LastNotified + cooldown
     if let Some(ln) = app.try_state::<LastNotified>() {
         let mut counts = ln.counts.lock().unwrap();
         let mut timestamps = ln.timestamps.lock().unwrap();
@@ -111,7 +108,6 @@ fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
             } else {
                 format!("You have {} unread messages", count)
             };
-            // Resolve icon path for notification
             let icon_path = app
                 .path()
                 .resolve("icons/icon.png", BaseDirectory::Resource)
@@ -221,7 +217,7 @@ async fn open_messenger(app: AppHandle, messenger: String) -> Result<String, Str
         .user_agent(CHROME_UA)
         .data_store_identifier(config.data_store_id)
         .on_navigation(nav_guard)
-        .devtools(true)
+        .devtools(cfg!(debug_assertions))
         .initialization_script(init_script);
 
     hide_all_messengers(&app);

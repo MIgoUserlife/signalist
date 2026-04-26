@@ -1,19 +1,16 @@
 (function () {
   'use strict';
 
-  // --- Constants ---
   const MESSENGER = 'whatsapp';
   const DEBOUNCE_MS = 300;
   const MAX_DELAY_MS = 2000;
 
-  // --- Mutable state (MUST be declared before any function that reads them is CALLED) ---
   let _pendingCount = null;
   let _pollTimer = null;
   let _debounceTimer = null;
   let _lastFireTime = Date.now();
   let lastCount = -1;
 
-  // --- Function declarations (hoisted, safe to reference) ---
   function resolveInvoke() {
     if (window.__TAURI_INTERNALS__ && typeof window.__TAURI_INTERNALS__.invoke === 'function') {
       return window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__);
@@ -203,10 +200,8 @@
     console.log('[Signalist Inject] ' + MESSENGER + ' fetch() patched (Tauri #15216 workaround)');
   })();
 
-  // --- Startup logging ---
   console.log('[Signalist Inject] ' + MESSENGER + '.js loaded, TAURI_INTERNALS at load:', !!window.__TAURI_INTERNALS__);
 
-  // --- Normal observers + initial check ---
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
       setupObservers();
