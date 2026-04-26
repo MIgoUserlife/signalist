@@ -92,12 +92,31 @@ fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
         let mut counts = ln.counts.lock().unwrap();
         let mut timestamps = ln.timestamps.lock().unwrap();
         let last_notified = counts.get(&messenger).copied().unwrap_or(0);
+
+        // count decreased — user read some messages; update baseline downward, no notification needed
+        if count < last_notified {
+            counts.insert(messenger.clone(), count);
+            return;
+        }
+
         let cooldown_ok = match timestamps.get(&messenger) {
             Some(last) => last.elapsed() >= Duration::from_secs(5),
             None => true,
         };
 
         if count > last_notified && cooldown_ok {
+            // suppress notification if window is focused; still advance baseline
+            let window_focused = app
+                .get_window("main")
+                .and_then(|w| w.is_focused().ok())
+                .unwrap_or(false);
+
+            if window_focused {
+                counts.insert(messenger.clone(), count);
+                timestamps.insert(messenger.clone(), Instant::now());
+                return;
+            }
+
             let display_name = match messenger.as_str() {
                 "telegram" => "Telegram",
                 "whatsapp" => "WhatsApp",
