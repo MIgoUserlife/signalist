@@ -10,4 +10,11 @@ commands.allow = [
   "get_active_messenger",
   "get_autostart",
   "set_autostart",
+  "list_custom_shortcuts",
+  "add_custom_shortcut",
+  "remove_custom_shortcut",
+  "open_custom_shortcut",
+  "open_add_shortcut_window",
+  "open_edit_shortcut_window",
+  "update_custom_shortcut",
 ]

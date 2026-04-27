@@ -1,14 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "messenger-ipc",
-  "description": "IPC access for messenger webviews (Telegram, WhatsApp) to report unread counts to the backend",
+  "description": "IPC access for messenger webviews (Telegram, WhatsApp, custom shortcuts) to report unread counts to the backend",
   "windows": ["main"],
-  "webviews": ["telegram", "whatsapp"],
+  "webviews": ["telegram", "whatsapp", "custom-*"],
   "remote": {
     "urls": [
       "https://web.telegram.org/*",
       "https://t.me/*",
-      "https://web.whatsapp.com/*"
+      "https://web.whatsapp.com/*",
+      "https://*/*"
     ]
   },
   "permissions": [

@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     path::BaseDirectory,
     tray::TrayIconBuilder,
     webview::WebviewBuilder, AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, State,
-    RunEvent, WebviewUrl, WindowBuilder, WindowEvent,
+    RunEvent, WebviewUrl, WebviewWindowBuilder, WindowBuilder, WindowEvent,
 };
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
@@ -17,7 +17,12 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 const SIDEBAR_WIDTH: f64 = 72.0;
 
 const CHROME_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+// Safari UA for custom shortcuts: matches WKWebView's actual TLS fingerprint,
+// accepted by Google OAuth and Cloudflare bot checks.
+const SAFARI_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+    AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15";
 
 struct Messenger {
     label: &'static str,
@@ -62,6 +67,63 @@ pub struct HotkeyConfig(pub Mutex<String>);
 
 pub struct DockHidden(pub Mutex<bool>);
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomShortcut {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+}
+
+impl CustomShortcut {
+    fn webview_label(&self) -> String {
+        custom_webview_label(&self.id)
+    }
+}
+
+fn custom_webview_label(id: &str) -> String {
+    format!("custom-{}", id)
+}
+
+pub struct CustomShortcuts(pub Mutex<Vec<CustomShortcut>>);
+
+fn is_google_domain(domain: &str) -> bool {
+    let d = domain.trim_start_matches("www.").to_ascii_lowercase();
+    d == "google.com"
+        || d.ends_with(".google.com")
+        || d == "googleusercontent.com"
+        || d.ends_with(".googleusercontent.com")
+        || d == "googleapis.com"
+        || d.ends_with(".googleapis.com")
+        || d == "youtube.com"
+        || d.ends_with(".youtube.com")
+}
+
+fn domain_to_data_store_id(domain: &str) -> [u8; 16] {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in domain.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let h = hash.to_le_bytes();
+    [0xCC, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 0, 0, 0, 0, 0, 0, 0]
+}
+
+fn generate_shortcut_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    format!("{:08x}{:08x}", d.as_secs(), d.subsec_nanos())
+}
+
+fn persist_custom_shortcuts(app: &AppHandle) -> Result<(), String> {
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    let shortcuts = app.state::<CustomShortcuts>().0.lock().unwrap().clone();
+    let json = serde_json::to_value(&shortcuts).map_err(|e| e.to_string())?;
+    store.set("custom_shortcuts", json);
+    store.save().map_err(|e| e.to_string())
+}
+
 #[derive(Clone, Serialize)]
 struct UnreadUpdatePayload {
     messenger: String,
@@ -86,6 +148,18 @@ fn build_tray_menu(app: &AppHandle) -> Menu<tauri::Wry> {
         let label = format!("{}  {}", dot, display);
         let item = MenuItem::with_id(app, m.label, &label, true, None::<&str>).unwrap();
         menu.append(&item).unwrap();
+    }
+
+    if let Some(state) = app.try_state::<CustomShortcuts>() {
+        let shortcuts: Vec<(String, String)> = state.0.lock().unwrap()
+            .iter()
+            .map(|sc| (sc.webview_label(), sc.name.clone()))
+            .collect();
+        for (webview_label, name) in &shortcuts {
+            let label = format!("○  {}", name);
+            let item = MenuItem::with_id(app, webview_label, &label, true, None::<&str>).unwrap();
+            menu.append(&item).unwrap();
+        }
     }
 
     menu.append(&PredefinedMenuItem::separator(app).unwrap()).unwrap();
@@ -275,6 +349,15 @@ fn reposition_webviews(app: &AppHandle) {
             let _ = webview.set_size(LogicalSize::new(content_width, logical.height));
         }
     }
+    if let Some(state) = app.try_state::<CustomShortcuts>() {
+        let labels: Vec<String> = state.0.lock().unwrap().iter().map(|sc| sc.webview_label()).collect();
+        for label in &labels {
+            if let Some(webview) = app.get_webview(label) {
+                let _ = webview.set_position(LogicalPosition::new(SIDEBAR_WIDTH, 0.0));
+                let _ = webview.set_size(LogicalSize::new(content_width, logical.height));
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -399,10 +482,185 @@ fn get_active_messenger(app: AppHandle) -> Result<String, String> {
     Ok(active.clone())
 }
 
+#[tauri::command]
+async fn open_add_shortcut_window(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("add-shortcut") {
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(
+        &app,
+        "add-shortcut",
+        WebviewUrl::App("index.html?view=add-shortcut".into()),
+    )
+    .title("Add Web Shortcut")
+    .inner_size(360.0, 400.0)
+    .min_inner_size(360.0, 400.0)
+    .resizable(false)
+    .center()
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_edit_shortcut_window(app: AppHandle, id: String) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("edit-shortcut") {
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    let url = format!("index.html?view=edit-shortcut&id={}", id);
+    WebviewWindowBuilder::new(
+        &app,
+        "edit-shortcut",
+        WebviewUrl::App(url.into()),
+    )
+    .title("Edit Web Shortcut")
+    .inner_size(360.0, 400.0)
+    .min_inner_size(360.0, 400.0)
+    .resizable(false)
+    .center()
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn update_custom_shortcut(
+    app: AppHandle,
+    id: String,
+    name: String,
+    url: String,
+    icon: Option<String>,
+) -> Result<CustomShortcut, String> {
+    let parsed: tauri::Url = url.parse().map_err(|e| format!("Invalid URL: {}", e))?;
+    let host = parsed.host_str().ok_or("URL has no host")?;
+    if is_google_domain(host) {
+        return Err("Google services (Gemini, Google, YouTube) are not supported in the embedded window due to Google's policy".into());
+    }
+
+    let label = custom_webview_label(&id);
+    let (updated, url_changed) = {
+        let state = app.state::<CustomShortcuts>();
+        let mut shortcuts = state.0.lock().unwrap();
+        let sc = shortcuts.iter_mut().find(|s| s.id == id)
+            .ok_or_else(|| format!("Shortcut not found: {}", id))?;
+        let url_changed = sc.url != url;
+        sc.name = name;
+        sc.url = url;
+        sc.icon = icon;
+        (sc.clone(), url_changed)
+    };
+
+    if url_changed {
+        if let Some(webview) = app.get_webview(&label) {
+            let _ = webview.close();
+        }
+    }
+
+    persist_custom_shortcuts(&app)?;
+    update_tray(&app);
+    let _ = app.emit("shortcut-updated", updated.clone());
+    Ok(updated)
+}
+
+#[tauri::command]
+fn list_custom_shortcuts(app: AppHandle) -> Result<Vec<CustomShortcut>, String> {
+    Ok(app.state::<CustomShortcuts>().0.lock().unwrap().clone())
+}
+
+#[tauri::command]
+fn add_custom_shortcut(app: AppHandle, name: String, url: String, icon: Option<String>) -> Result<CustomShortcut, String> {
+    let parsed: tauri::Url = url.parse().map_err(|e| format!("Invalid URL: {}", e))?;
+    let host = parsed.host_str().ok_or("URL has no host")?;
+    if is_google_domain(host) {
+        return Err("Google services (Gemini, Google, YouTube) are not supported in the embedded window due to Google's policy".into());
+    }
+    let sc = CustomShortcut { id: generate_shortcut_id(), name, url, icon };
+    app.state::<CustomShortcuts>().0.lock().unwrap().push(sc.clone());
+    persist_custom_shortcuts(&app)?;
+    update_tray(&app);
+    Ok(sc)
+}
+
+#[tauri::command]
+fn remove_custom_shortcut(app: AppHandle, id: String) -> Result<(), String> {
+    let label = custom_webview_label(&id);
+    if let Some(webview) = app.get_webview(&label) {
+        webview.close().map_err(|e| e.to_string())?;
+    }
+    app.state::<CustomShortcuts>().0.lock().unwrap().retain(|sc| sc.id != id);
+    persist_custom_shortcuts(&app)?;
+    update_tray(&app);
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_custom_shortcut(
+    app: AppHandle,
+    id: String,
+    url: String,
+) -> Result<String, String> {
+    let label = custom_webview_label(&id);
+
+    if let Some(webview) = app.get_webview(&label) {
+        hide_all_messengers(&app);
+        webview.show().map_err(|e| e.to_string())?;
+        webview.set_focus().map_err(|e| e.to_string())?;
+        *app.state::<ActiveMessenger>().0.lock().unwrap() = label.clone();
+        let _ = app.emit("active-messenger-changed", label.clone());
+        return Ok(format!("Focused existing {}", label));
+    }
+
+    let parsed_url: tauri::Url = url.parse().map_err(|e| format!("Invalid URL: {}", e))?;
+    let origin_host = parsed_url.host_str().ok_or("URL has no host")?.to_string();
+    if is_google_domain(&origin_host) {
+        return Err("Google services are not supported in the embedded window. Please delete this shortcut and open the website in your browser.".into());
+    }
+    let data_store_id = domain_to_data_store_id(&origin_host);
+
+    let nav_guard = move |nav_url: &tauri::Url| -> bool {
+        matches!(nav_url.scheme(), "https" | "http")
+    };
+
+    let window = app.get_window("main").ok_or("Main window not found")?;
+    let logical = get_logical_size(&window)?;
+
+    let inject = include_str!("../inject/shortcut.js");
+
+    let webview_builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed_url))
+        .user_agent(SAFARI_UA)
+        .data_store_identifier(data_store_id)
+        .on_navigation(nav_guard)
+        .devtools(cfg!(debug_assertions))
+        .initialization_script(inject);
+
+    hide_all_messengers(&app);
+    window
+        .add_child(
+            webview_builder,
+            LogicalPosition::new(SIDEBAR_WIDTH, 0.0),
+            LogicalSize::new(logical.width - SIDEBAR_WIDTH, logical.height),
+        )
+        .map_err(|e| e.to_string())?;
+
+    *app.state::<ActiveMessenger>().0.lock().unwrap() = label.clone();
+    let _ = app.emit("active-messenger-changed", label.clone());
+    Ok(format!("Created {}", label))
+}
+
 fn hide_all_messengers(app: &AppHandle) {
     for m in MESSENGERS {
         if let Some(webview) = app.get_webview(m.label) {
             let _ = webview.hide();
+        }
+    }
+    if let Some(state) = app.try_state::<CustomShortcuts>() {
+        let labels: Vec<String> = state.0.lock().unwrap().iter().map(|sc| sc.webview_label()).collect();
+        for label in &labels {
+            if let Some(webview) = app.get_webview(label) {
+                let _ = webview.hide();
+            }
         }
     }
 }
@@ -492,6 +750,7 @@ pub fn run() {
         .manage(LastNotified::default())
         .manage(HotkeyConfig(Mutex::new(String::new())))
         .manage(DockHidden(Mutex::new(false)))
+        .manage(CustomShortcuts(Mutex::new(Vec::new())))
         .invoke_handler(tauri::generate_handler![
             open_messenger,
             switch_messenger,
@@ -503,6 +762,13 @@ pub fn run() {
             get_autostart,
             set_autostart,
             toggle_dock_icon,
+            open_add_shortcut_window,
+            open_edit_shortcut_window,
+            list_custom_shortcuts,
+            add_custom_shortcut,
+            update_custom_shortcut,
+            remove_custom_shortcut,
+            open_custom_shortcut,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -545,6 +811,13 @@ pub fn run() {
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
                 .unwrap_or_else(|| "Super+Shift+S".to_string());
             *app.state::<HotkeyConfig>().0.lock().unwrap() = saved_hotkey.clone();
+
+            let saved_shortcuts: Vec<CustomShortcut> = store
+                .get("custom_shortcuts")
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            *app.state::<CustomShortcuts>().0.lock().unwrap() = saved_shortcuts;
+
             app.handle()
                 .global_shortcut()
                 .on_shortcut(saved_hotkey.as_str(), |app_handle, _, event| {
@@ -576,6 +849,21 @@ pub fn run() {
                             tauri::async_runtime::spawn(async move {
                                 let _ = open_messenger(app_clone, messenger).await;
                             });
+                        }
+                        id if id.starts_with("custom-") => {
+                            if let Some(window) = app.get_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                            let id_str = id.to_string();
+                            let shortcuts = app.state::<CustomShortcuts>().0.lock().unwrap().clone();
+                            if let Some(sc) = shortcuts.iter().find(|s| s.webview_label() == id_str) {
+                                let sc = sc.clone();
+                                let app_clone = app.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    let _ = open_custom_shortcut(app_clone, sc.id, sc.url).await;
+                                });
+                            }
                         }
                         "toggle_window" => toggle_window(app),
                         "toggle_dock" => do_toggle_dock_icon(app),
