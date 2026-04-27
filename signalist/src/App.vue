@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { MessageCircle, Send } from "lucide-vue-next";
 
 const activeMessenger = ref("telegram");
@@ -28,6 +31,12 @@ const isRecordingHotkey = ref(false);
 const hotkeyError = ref("");
 
 const autostartEnabled = ref(false);
+
+const appVersion = ref("");
+
+const updateAvailable = ref(false);
+const updateVersion = ref("");
+const isInstalling = ref(false);
 
 function formatHotkeyDisplay(hotkey: string): string {
   return hotkey
@@ -73,6 +82,20 @@ function startRecordingHotkey() {
   isRecordingHotkey.value = true;
   hotkeyError.value = "";
   window.addEventListener("keydown", captureHotkey, { once: true });
+}
+
+async function installUpdate() {
+  isInstalling.value = true;
+  try {
+    const update = await check();
+    if (update?.available) {
+      await update.downloadAndInstall();
+      await relaunch();
+    }
+  } catch (e) {
+    console.error("Update install failed:", e);
+    isInstalling.value = false;
+  }
 }
 
 async function toggleAutostart() {
@@ -131,6 +154,22 @@ onMounted(async () => {
   unlistenActive = await listen<string>("active-messenger-changed", (event) => {
     activeMessenger.value = event.payload;
   });
+
+  try {
+    appVersion.value = await getVersion();
+  } catch (e) {
+    console.warn("Failed to get app version:", e);
+  }
+
+  try {
+    const update = await check();
+    if (update?.available) {
+      updateAvailable.value = true;
+      updateVersion.value = update.version;
+    }
+  } catch (e) {
+    console.warn("Update check failed:", e);
+  }
 });
 
 onUnmounted(() => {
@@ -166,8 +205,11 @@ openMessenger("telegram");
     class="glass fixed top-0 left-0 z-50 flex h-screen w-[72px] flex-col items-center border-r border-glass-border select-none"
   >
     <!-- Zone 1: Logo -->
-    <div class="flex w-full flex-col items-center pt-3 pb-3">
+    <div class="flex w-full flex-col items-center pt-3 pb-2">
       <img src="./assets/logo.png" alt="Signalist" class="h-10 w-10 rounded-xl" draggable="false" />
+      <span v-if="appVersion" class="mt-1 text-[9px] leading-none text-text-muted select-none opacity-50">
+        v{{ appVersion }}
+      </span>
     </div>
 
     <div class="w-10 border-t border-glass-border" />
@@ -201,6 +243,20 @@ openMessenger("telegram");
     <div class="mt-auto w-full flex flex-col items-center">
       <div class="w-10 border-t border-glass-border mb-1" />
       <div class="mb-3 flex flex-col items-center gap-1">
+        <button
+          v-if="updateAvailable"
+          class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150 text-accent hover:bg-surface-hover"
+          :title="`Оновлення ${updateVersion} доступне — натисніть, щоб встановити`"
+          :disabled="isInstalling"
+          @click="installUpdate"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2v13M7 13l5 5 5-5"/><path d="M20 21H4"/>
+          </svg>
+          <span class="text-[9px] leading-none opacity-70 select-none font-medium">
+            {{ isInstalling ? '···' : 'UPD' }}
+          </span>
+        </button>
         <button
           class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"
           :class="autostartEnabled

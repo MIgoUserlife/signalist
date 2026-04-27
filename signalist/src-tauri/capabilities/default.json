@@ -39,6 +39,11 @@
     "autostart:allow-disable",
     "autostart:allow-is-enabled",
     "core:tray:default",
-    "core:menu:default"
+    "core:menu:default",
+    "updater:default",
+    "updater:allow-check",
+    "updater:allow-download-and-install",
+    "process:default",
+    "process:allow-restart"
   ]
 }
