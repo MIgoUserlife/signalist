@@ -97,6 +97,7 @@ async function saveHotkey(shortcut: string) {
 }
 
 let unlisten: UnlistenFn | null = null;
+let unlistenActive: UnlistenFn | null = null;
 
 onMounted(async () => {
   // Request notification permission if not already granted
@@ -126,10 +127,15 @@ onMounted(async () => {
       unreadCounts[event.payload.messenger] = event.payload.count;
     },
   );
+
+  unlistenActive = await listen<string>("active-messenger-changed", (event) => {
+    activeMessenger.value = event.payload;
+  });
 });
 
 onUnmounted(() => {
   unlisten?.();
+  unlistenActive?.();
 });
 
 async function openMessenger(label: string) {

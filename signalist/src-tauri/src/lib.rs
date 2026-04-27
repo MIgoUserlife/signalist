@@ -3,7 +3,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use serde::Serialize;
 use tauri::{
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     path::BaseDirectory,
+    tray::TrayIconBuilder,
     webview::WebviewBuilder, AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, State,
     RunEvent, WebviewUrl, WindowBuilder, WindowEvent,
 };
@@ -58,10 +60,90 @@ pub struct LastNotified {
 
 pub struct HotkeyConfig(pub Mutex<String>);
 
+pub struct DockHidden(pub Mutex<bool>);
+
 #[derive(Clone, Serialize)]
 struct UnreadUpdatePayload {
     messenger: String,
     count: u32,
+}
+
+fn build_tray_menu(app: &AppHandle) -> Menu<tauri::Wry> {
+    let counts = app.state::<UnreadCounts>().0.lock().unwrap().clone();
+    let hotkey = app.state::<HotkeyConfig>().0.lock().unwrap().clone();
+    let dock_hidden = *app.state::<DockHidden>().0.lock().unwrap();
+
+    let menu = Menu::new(app).unwrap();
+
+    for m in MESSENGERS {
+        let count = counts.get(m.label).copied().unwrap_or(0);
+        let display = match m.label {
+            "telegram" => "Telegram",
+            "whatsapp" => "WhatsApp",
+            _ => m.label,
+        };
+        let dot = if count > 0 { "◉" } else { "○" };
+        let label = format!("{}  {}", dot, display);
+        let item = MenuItem::with_id(app, m.label, &label, true, None::<&str>).unwrap();
+        menu.append(&item).unwrap();
+    }
+
+    menu.append(&PredefinedMenuItem::separator(app).unwrap()).unwrap();
+
+    let accel = hotkey.replace("Super", "Cmd");
+    let toggle_item = MenuItem::with_id(
+        app,
+        "toggle_window",
+        "⧉  Show/Hide",
+        true,
+        Some(accel.as_str()),
+    )
+    .unwrap();
+    menu.append(&toggle_item).unwrap();
+
+    menu.append(&PredefinedMenuItem::separator(app).unwrap()).unwrap();
+
+    let dock_label = if dock_hidden {
+        "▭  Show in Dock"
+    } else {
+        "▭  Hide in Dock"
+    };
+    let dock_item = MenuItem::with_id(app, "toggle_dock", dock_label, true, None::<&str>).unwrap();
+    menu.append(&dock_item).unwrap();
+
+    menu.append(&PredefinedMenuItem::separator(app).unwrap()).unwrap();
+
+    let quit_item = MenuItem::with_id(app, "quit", "⏻  Quit", true, Some("Cmd+Q")).unwrap();
+    menu.append(&quit_item).unwrap();
+
+    menu
+}
+
+fn update_tray(app: &AppHandle) {
+    let Some(tray) = app.tray_by_id("main-tray") else { return };
+    let menu = build_tray_menu(app);
+    let _ = tray.set_menu(Some(menu));
+    let total: u32 = app.state::<UnreadCounts>().0.lock().unwrap().values().sum();
+    // template=true → dim (standard menu bar), template=false → bright (full color, visually active)
+    let _ = tray.set_icon_as_template(total == 0);
+}
+
+fn do_toggle_dock_icon(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        let new_hidden = {
+            let state = app.state::<DockHidden>();
+            let mut hidden = state.0.lock().unwrap();
+            *hidden = !*hidden;
+            *hidden
+        };
+        if new_hidden {
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+        } else {
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+        }
+        update_tray(app);
+    }
 }
 
 #[tauri::command]
@@ -81,6 +163,8 @@ fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
         }
         map.insert(messenger.clone(), count);
     }
+
+    update_tray(&app);
 
     let _ = app.emit("unread-update", UnreadUpdatePayload { messenger: messenger.clone(), count });
 
@@ -207,6 +291,8 @@ async fn open_messenger(app: AppHandle, messenger: String) -> Result<String, Str
         let state = app.state::<ActiveMessenger>();
         let mut active = state.0.lock().unwrap();
         *active = messenger.clone();
+        drop(active);
+        let _ = app.emit("active-messenger-changed", messenger.clone());
         return Ok(format!("Focused existing {}", config.label));
     }
 
@@ -257,6 +343,8 @@ async fn open_messenger(app: AppHandle, messenger: String) -> Result<String, Str
     let state = app.state::<ActiveMessenger>();
     let mut active = state.0.lock().unwrap();
     *active = messenger.clone();
+    drop(active);
+    let _ = app.emit("active-messenger-changed", messenger.clone());
 
     Ok(format!("Created {}", config.label))
 }
@@ -283,7 +371,9 @@ fn switch_messenger(app: AppHandle, messenger: String) -> Result<(), String> {
 
     let state = app.state::<ActiveMessenger>();
     let mut active = state.0.lock().unwrap();
-    *active = messenger;
+    *active = messenger.clone();
+    drop(active);
+    let _ = app.emit("active-messenger-changed", messenger);
 
     Ok(())
 }
@@ -339,6 +429,11 @@ fn toggle_window(app: &AppHandle) {
 }
 
 #[tauri::command]
+fn toggle_dock_icon(app: AppHandle) {
+    do_toggle_dock_icon(&app);
+}
+
+#[tauri::command]
 fn get_autostart(app: AppHandle) -> bool {
     app.autolaunch().is_enabled().unwrap_or(false)
 }
@@ -378,7 +473,9 @@ fn set_global_shortcut(
     *state.0.lock().unwrap() = shortcut.clone();
     let store = app.store("settings.json").map_err(|e| e.to_string())?;
     store.set("hotkey", serde_json::Value::String(shortcut));
-    store.save().map_err(|e| e.to_string())
+    store.save().map_err(|e| e.to_string())?;
+    update_tray(&app);
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -392,6 +489,7 @@ pub fn run() {
         .manage(UnreadCounts::default())
         .manage(LastNotified::default())
         .manage(HotkeyConfig(Mutex::new(String::new())))
+        .manage(DockHidden(Mutex::new(false)))
         .invoke_handler(tauri::generate_handler![
             open_messenger,
             switch_messenger,
@@ -402,6 +500,7 @@ pub fn run() {
             set_global_shortcut,
             get_autostart,
             set_autostart,
+            toggle_dock_icon,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -452,6 +551,37 @@ pub fn run() {
                     }
                 })
                 .expect("Failed to register global shortcut");
+
+            // Build tray icon
+            let tray_menu = build_tray_menu(app.handle());
+            let icon = app.default_window_icon().cloned()
+                .expect("No default window icon");
+
+            TrayIconBuilder::with_id("main-tray")
+                .icon(icon)
+                .icon_as_template(true)
+                .menu(&tray_menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event(|app, event| {
+                    match event.id.as_ref() {
+                        id @ ("telegram" | "whatsapp") => {
+                            if let Some(window) = app.get_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                            let messenger = id.to_string();
+                            let app_clone = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let _ = open_messenger(app_clone, messenger).await;
+                            });
+                        }
+                        "toggle_window" => toggle_window(app),
+                        "toggle_dock" => do_toggle_dock_icon(app),
+                        "quit" => std::process::exit(0),
+                        _ => {}
+                    }
+                })
+                .build(app)?;
 
             Ok(())
         })
