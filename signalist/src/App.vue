@@ -157,15 +157,17 @@ openMessenger("telegram");
 
 <template>
   <nav
-    class="glass fixed top-0 left-0 z-50 flex h-screen w-[72px] flex-col items-center border-r border-glass-border pt-3 select-none"
+    class="glass fixed top-0 left-0 z-50 flex h-screen w-[72px] flex-col items-center border-r border-glass-border select-none"
   >
-    <div
-      class="mb-5 flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-brand-purple to-brand-blue text-xl font-bold text-white"
-    >
-      S
+    <!-- Zone 1: Logo -->
+    <div class="flex w-full flex-col items-center pt-3 pb-3">
+      <img src="./assets/logo.png" alt="Signalist" class="h-10 w-10 rounded-xl" draggable="false" />
     </div>
 
-    <div class="flex w-full flex-col items-center gap-2 px-2">
+    <div class="w-10 border-t border-glass-border" />
+
+    <!-- Zone 2: Messengers -->
+    <div class="flex w-full flex-col items-center gap-2 px-2 pt-3">
       <div v-for="m in messengers" :key="m.label" class="relative">
         <button
           :class="[
@@ -189,36 +191,40 @@ openMessenger("telegram");
       </div>
     </div>
 
-    <div class="mt-auto mb-4 flex flex-col items-center gap-1">
-      <button
-        class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"
-        :class="autostartEnabled
-          ? 'text-accent hover:bg-surface-hover'
-          : 'text-text-muted hover:bg-surface-hover hover:text-text-primary'"
-        :title="autostartEnabled ? 'Автозапуск увімкнено — натисніть, щоб вимкнути' : 'Автозапуск вимкнено — натисніть, щоб увімкнути'"
-        @click="toggleAutostart"
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
-        </svg>
-        <span class="text-[9px] leading-none opacity-70 select-none font-medium">
-          {{ autostartEnabled ? 'AUTO' : 'auto' }}
-        </span>
-      </button>
-      <span v-if="hotkeyError" class="text-[8px] text-red-400 leading-none text-center px-1">{{ hotkeyError }}</span>
-      <button
-        class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"
-        :class="isRecordingHotkey
-          ? 'text-accent bg-surface-hover animate-pulse'
-          : 'text-text-muted hover:bg-surface-hover hover:text-text-primary'"
-        :title="isRecordingHotkey ? 'Press key combination (Esc to cancel)' : `Global hotkey: ${currentHotkey} — click to change`"
-        @click="isRecordingHotkey ? null : startRecordingHotkey()"
-      >
-        <span class="text-base leading-none select-none">⌨</span>
-        <span class="text-[9px] leading-none opacity-70 select-none font-medium">
-          {{ isRecordingHotkey ? '···' : formatHotkeyDisplay(currentHotkey) }}
-        </span>
-      </button>
+    <!-- Zone 3: Settings -->
+    <div class="mt-auto w-full flex flex-col items-center">
+      <div class="w-10 border-t border-glass-border mb-1" />
+      <div class="mb-3 flex flex-col items-center gap-1">
+        <button
+          class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"
+          :class="autostartEnabled
+            ? 'text-accent hover:bg-surface-hover'
+            : 'text-text-muted hover:bg-surface-hover hover:text-text-primary'"
+          :title="autostartEnabled ? 'Автозапуск увімкнено — натисніть, щоб вимкнути' : 'Автозапуск вимкнено — натисніть, щоб увімкнути'"
+          @click="toggleAutostart"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+          </svg>
+          <span class="text-[9px] leading-none opacity-70 select-none font-medium">
+            {{ autostartEnabled ? 'AUTO' : 'auto' }}
+          </span>
+        </button>
+        <span v-if="hotkeyError" class="text-[8px] text-red-400 leading-none text-center px-1">{{ hotkeyError }}</span>
+        <button
+          class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"
+          :class="isRecordingHotkey
+            ? 'text-accent bg-surface-hover animate-pulse'
+            : 'text-text-muted hover:bg-surface-hover hover:text-text-primary'"
+          :title="isRecordingHotkey ? 'Press key combination (Esc to cancel)' : `Global hotkey: ${currentHotkey} — click to change`"
+          @click="isRecordingHotkey ? null : startRecordingHotkey()"
+        >
+          <span class="text-base leading-none select-none">⌨</span>
+          <span class="text-[9px] leading-none opacity-70 select-none font-medium">
+            {{ isRecordingHotkey ? '···' : formatHotkeyDisplay(currentHotkey) }}
+          </span>
+        </button>
+      </div>
     </div>
   </nav>
 
