@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted } from "vue";
+import { ref, reactive, watch, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -7,6 +7,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import logoIcon from './assets/logo.svg?raw';
 import telegramIcon from './assets/icons/telegram.svg?raw';
 import whatsappIcon from './assets/icons/whatsapp.svg?raw';
 
@@ -97,6 +98,22 @@ const isRecordingHotkey = ref(false);
 const hotkeyError = ref("");
 
 const autostartEnabled = ref(false);
+const settingsOpen = ref(false);
+const settingsWrapper = ref<HTMLElement | null>(null);
+
+function onDocumentClick(e: MouseEvent) {
+  if (settingsWrapper.value && !settingsWrapper.value.contains(e.target as Node)) {
+    settingsOpen.value = false;
+  }
+}
+
+watch(settingsOpen, (open) => {
+  if (open) {
+    document.addEventListener("click", onDocumentClick);
+  } else {
+    document.removeEventListener("click", onDocumentClick);
+  }
+});
 
 const appVersion = ref("");
 
@@ -315,6 +332,7 @@ onUnmounted(() => {
   unlistenActive?.();
   unlistenShortcutAdded?.();
   unlistenShortcutUpdated?.();
+  document.removeEventListener("click", onDocumentClick);
 });
 
 async function openMessenger(label: string) {
@@ -491,7 +509,7 @@ if (!isDialogView && !isEditDialogView) {
     >
       <!-- Zone 1: Logo -->
       <div class="flex w-full flex-col items-center pt-3 pb-2">
-        <img src="./assets/logo.png" alt="Signalist" class="h-10 w-10 rounded-xl" draggable="false" />
+        <span class="flex h-10 w-10 items-center justify-center text-accent [&>svg]:h-10 [&>svg]:w-10" v-html="logoIcon" />
         <span v-if="appVersion" class="mt-1 text-[9px] leading-none text-text-muted select-none opacity-50">
           v{{ appVersion }}
         </span>
@@ -546,7 +564,7 @@ if (!isDialogView && !isEditDialogView) {
             <template v-else>{{ shortcutInitial(sc.name) }}</template>
           </button>
           <button
-            class="absolute -top-1 -right-1 hidden group-hover:flex items-center justify-center h-5 w-5 p-0 rounded-full bg-surface text-text-muted hover:bg-red-500 hover:text-white text-sm line-height cursor-pointer"
+            class="absolute -top-1 -right-1 hidden group-hover:flex items-center justify-center h-5 w-5 p-0 rounded-full bg-surface text-text-muted hover:bg-badge-bg hover:text-white text-sm line-height cursor-pointer"
             title="Remove"
             @click.stop="removeShortcut(sc.id)"
           >×</button>
@@ -566,49 +584,90 @@ if (!isDialogView && !isEditDialogView) {
       <!-- Zone 3: Settings -->
       <div class="mt-auto w-full flex flex-col items-center">
         <div class="w-10 border-t border-glass-border mb-1" />
-        <div class="mb-3 flex flex-col items-center gap-1">
-          <button
-            v-if="updateAvailable"
-            class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150 text-accent hover:bg-surface-hover"
-            :title="`Оновлення ${updateVersion} доступне — натисніть, щоб встановити`"
-            :disabled="isInstalling"
-            @click="installUpdate"
+
+        <!-- Settings gear + accordion panel wrapper -->
+        <div ref="settingsWrapper" class="relative w-full flex flex-col items-center mb-3">
+
+          <!-- Accordion panel — floats above shortcuts -->
+          <Transition
+            enter-active-class="transition-all duration-200 ease-out"
+            enter-from-class="opacity-0 translate-y-2"
+            enter-to-class="opacity-100 translate-y-0"
+            leave-active-class="transition-all duration-150 ease-in"
+            leave-from-class="opacity-100 translate-y-0"
+            leave-to-class="opacity-0 translate-y-2"
           >
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 2v13M7 13l5 5 5-5"/><path d="M20 21H4"/>
+            <div
+              v-if="settingsOpen"
+              class="absolute bottom-full left-0 w-full flex flex-col items-center gap-1 py-2 rounded-xl bg-surface border border-glass-border shadow-xl z-10"
+            >
+              <button
+                v-if="updateAvailable"
+                class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150 text-accent hover:bg-surface-hover"
+                :title="`Оновлення ${updateVersion} доступне — натисніть, щоб встановити`"
+                :disabled="isInstalling"
+                @click="installUpdate"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 2v13M7 13l5 5 5-5"/><path d="M20 21H4"/>
+                </svg>
+                <span class="text-[9px] leading-none opacity-70 select-none font-medium">
+                  {{ isInstalling ? '···' : 'UPD' }}
+                </span>
+              </button>
+
+              <button
+                class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"
+                :class="autostartEnabled ? 'text-accent hover:bg-surface-hover' : 'text-text-muted hover:bg-surface-hover hover:text-text-primary'"
+                :title="autostartEnabled ? 'Автозапуск увімкнено — натисніть, щоб вимкнути' : 'Автозапуск вимкнено — натисніть, щоб увімкнути'"
+                @click="toggleAutostart"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+                </svg>
+                <span class="text-[9px] leading-none opacity-70 select-none font-medium">
+                  {{ autostartEnabled ? 'AUTO' : 'auto' }}
+                </span>
+              </button>
+
+              <span v-if="hotkeyError" class="text-[8px] text-red-400 leading-none text-center px-1">{{ hotkeyError }}</span>
+
+              <button
+                class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"
+                :class="isRecordingHotkey ? 'text-accent bg-surface-hover animate-pulse' : 'text-text-muted hover:bg-surface-hover hover:text-text-primary'"
+                :title="isRecordingHotkey ? 'Press key combination (Esc to cancel)' : `Global hotkey: ${currentHotkey} — click to change`"
+                @click="isRecordingHotkey ? null : startRecordingHotkey()"
+              >
+                <span class="text-base leading-none select-none">⌨</span>
+                <span class="text-[9px] leading-none opacity-70 select-none font-medium">
+                  {{ isRecordingHotkey ? '···' : formatHotkeyDisplay(currentHotkey) }}
+                </span>
+              </button>
+            </div>
+          </Transition>
+
+          <!-- Gear button -->
+          <button
+            class="flex h-12 w-12 items-center justify-center rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"
+            :class="settingsOpen ? 'text-accent bg-surface-hover' : 'text-text-muted hover:bg-surface-hover hover:text-text-primary'"
+            title="Settings"
+            @click="settingsOpen = !settingsOpen"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="20" height="20"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              class="transition-transform duration-300"
+              :style="{ transform: settingsOpen ? 'rotate(90deg)' : 'rotate(0deg)' }"
+            >
+              <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>
+              <circle cx="12" cy="12" r="3"/>
             </svg>
-            <span class="text-[9px] leading-none opacity-70 select-none font-medium">
-              {{ isInstalling ? '···' : 'UPD' }}
-            </span>
-          </button>
-          <button
-            class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"
-            :class="autostartEnabled
-              ? 'text-accent hover:bg-surface-hover'
-              : 'text-text-muted hover:bg-surface-hover hover:text-text-primary'"
-            :title="autostartEnabled ? 'Автозапуск увімкнено — натисніть, щоб вимкнути' : 'Автозапуск вимкнено — натисніть, щоб увімкнути'"
-            @click="toggleAutostart"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
-            </svg>
-            <span class="text-[9px] leading-none opacity-70 select-none font-medium">
-              {{ autostartEnabled ? 'AUTO' : 'auto' }}
-            </span>
-          </button>
-          <span v-if="hotkeyError" class="text-[8px] text-red-400 leading-none text-center px-1">{{ hotkeyError }}</span>
-          <button
-            class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"
-            :class="isRecordingHotkey
-              ? 'text-accent bg-surface-hover animate-pulse'
-              : 'text-text-muted hover:bg-surface-hover hover:text-text-primary'"
-            :title="isRecordingHotkey ? 'Press key combination (Esc to cancel)' : `Global hotkey: ${currentHotkey} — click to change`"
-            @click="isRecordingHotkey ? null : startRecordingHotkey()"
-          >
-            <span class="text-base leading-none select-none">⌨</span>
-            <span class="text-[9px] leading-none opacity-70 select-none font-medium">
-              {{ isRecordingHotkey ? '···' : formatHotkeyDisplay(currentHotkey) }}
-            </span>
           </button>
         </div>
       </div>
