@@ -26,6 +26,7 @@ const SAFARI_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 
 struct Messenger {
     label: &'static str,
+    display_name: &'static str,
     url: &'static str,
     allowed_domains: &'static [&'static str],
     data_store_id: [u8; 16],
@@ -34,6 +35,7 @@ struct Messenger {
 const MESSENGERS: &[Messenger] = &[
     Messenger {
         label: "telegram",
+        display_name: "Telegram",
         url: "https://web.telegram.org/a/",
         allowed_domains: &["web.telegram.org", "t.me"],
         data_store_id: [
@@ -43,6 +45,7 @@ const MESSENGERS: &[Messenger] = &[
     },
     Messenger {
         label: "whatsapp",
+        display_name: "WhatsApp",
         url: "https://web.whatsapp.com/",
         allowed_domains: &["web.whatsapp.com", "whatsapp.com", "static.whatsapp.net"],
         data_store_id: [
@@ -58,10 +61,7 @@ pub struct ActiveMessenger(pub Mutex<String>);
 pub struct UnreadCounts(pub Mutex<HashMap<String, u32>>);
 
 #[derive(Default)]
-pub struct LastNotified {
-    pub counts: Mutex<HashMap<String, u32>>,
-    pub timestamps: Mutex<HashMap<String, Instant>>,
-}
+pub struct LastNotified(pub Mutex<HashMap<String, (u32, Option<Instant>)>>);
 
 pub struct HotkeyConfig(pub Mutex<String>);
 
@@ -139,13 +139,8 @@ fn build_tray_menu(app: &AppHandle) -> Menu<tauri::Wry> {
 
     for m in MESSENGERS {
         let count = counts.get(m.label).copied().unwrap_or(0);
-        let display = match m.label {
-            "telegram" => "Telegram",
-            "whatsapp" => "WhatsApp",
-            _ => m.label,
-        };
         let dot = if count > 0 { "◉" } else { "○" };
-        let label = format!("{}  {}", dot, display);
+        let label = format!("{}  {}", dot, m.display_name);
         let item = MenuItem::with_id(app, m.label, &label, true, None::<&str>).unwrap();
         menu.append(&item).unwrap();
     }
@@ -222,10 +217,10 @@ fn do_toggle_dock_icon(app: &AppHandle) {
 
 #[tauri::command]
 fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
-    if !MESSENGERS.iter().any(|m| m.label == messenger.as_str()) {
+    let Some(config) = MESSENGERS.iter().find(|m| m.label == messenger.as_str()) else {
         eprintln!("[Signalist] update_unread_count REJECTED unknown messenger: {}", messenger);
         return;
-    }
+    };
     let count = count.min(10_000);
     #[cfg(debug_assertions)]
     println!("[Signalist] update_unread_count CALLED for {} with count {}", messenger, count);
@@ -242,49 +237,33 @@ fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
 
     let _ = app.emit("unread-update", UnreadUpdatePayload { messenger: messenger.clone(), count });
 
-    // When count drops to 0, reset LastNotified baseline so future increases notify
-    if count == 0 {
-        if let Some(ln) = app.try_state::<LastNotified>() {
-            let mut counts = ln.counts.lock().unwrap();
-            counts.insert(messenger.clone(), 0);
-        }
-        return;
-    }
-
     if let Some(ln) = app.try_state::<LastNotified>() {
-        let mut counts = ln.counts.lock().unwrap();
-        let mut timestamps = ln.timestamps.lock().unwrap();
-        let last_notified = counts.get(&messenger).copied().unwrap_or(0);
+        let (last_count, last_time) = {
+            let state = ln.0.lock().unwrap();
+            state.get(&messenger).copied().unwrap_or_default()
+        };
 
-        // count decreased — user read some messages; update baseline downward, no notification needed
-        if count < last_notified {
-            counts.insert(messenger.clone(), count);
+        // count dropped — reset baseline, no notification
+        if count == 0 || count < last_count {
+            ln.0.lock().unwrap().entry(messenger.clone()).or_default().0 = count;
             return;
         }
 
-        let cooldown_ok = match timestamps.get(&messenger) {
-            Some(last) => last.elapsed() >= Duration::from_secs(5),
-            None => true,
-        };
+        let cooldown_ok = last_time
+            .map(|t: Instant| t.elapsed() >= Duration::from_secs(5))
+            .unwrap_or(true);
 
-        if count > last_notified && cooldown_ok {
-            // suppress notification if window is focused; still advance baseline
+        if count > last_count && cooldown_ok {
             let window_focused = app
                 .get_window("main")
                 .and_then(|w| w.is_focused().ok())
                 .unwrap_or(false);
 
             if window_focused {
-                counts.insert(messenger.clone(), count);
-                timestamps.insert(messenger.clone(), Instant::now());
+                ln.0.lock().unwrap().insert(messenger.clone(), (count, Some(Instant::now())));
                 return;
             }
 
-            let display_name = match messenger.as_str() {
-                "telegram" => "Telegram",
-                "whatsapp" => "WhatsApp",
-                _ => &messenger,
-            };
             let body = if count == 1 {
                 "You have 1 unread message".to_string()
             } else {
@@ -299,7 +278,7 @@ fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
             let mut builder = app
                 .notification()
                 .builder()
-                .title(format!("New message on {}", display_name))
+                .title(format!("New message on {}", config.display_name))
                 .body(body);
 
             if !icon_path.is_empty() {
@@ -308,14 +287,13 @@ fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
 
             match builder.show() {
                 #[cfg(debug_assertions)]
-                Ok(()) => println!("[Signalist] Notification sent for {}", display_name),
+                Ok(()) => println!("[Signalist] Notification sent for {}", config.display_name),
                 #[cfg(not(debug_assertions))]
                 Ok(()) => {}
-                Err(e) => eprintln!("[Signalist] Notification failed for {}: {}", display_name, e),
+                Err(e) => eprintln!("[Signalist] Notification failed for {}: {}", config.display_name, e),
             }
 
-            counts.insert(messenger.clone(), count);
-            timestamps.insert(messenger.clone(), Instant::now());
+            ln.0.lock().unwrap().insert(messenger.clone(), (count, Some(Instant::now())));
         }
     }
 }
@@ -439,16 +417,12 @@ fn switch_messenger(app: AppHandle, messenger: String) -> Result<(), String> {
         .find(|m| m.label == messenger)
         .ok_or_else(|| format!("Unknown messenger: {}", messenger))?;
 
-    if app.get_webview(config.label).is_none() {
-        return Err(format!(
-            "{} webview not created yet. Call open_messenger first.",
-            messenger
-        ));
-    }
+    let webview = app.get_webview(config.label).ok_or_else(|| {
+        format!("{} webview not created yet. Call open_messenger first.", messenger)
+    })?;
 
     hide_all_messengers(&app);
 
-    let webview = app.get_webview(config.label).unwrap();
     webview.show().map_err(|e| e.to_string())?;
     webview.set_focus().map_err(|e| e.to_string())?;
 

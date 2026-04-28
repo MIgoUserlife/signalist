@@ -1,8 +1,21 @@
 # Signalist
 
-Компактний десктопний застосунок для одночасної роботи з Telegram і WhatsApp Web. Вузька бічна панель (72 px) із перемикачем месенджерів, бейджами непрочитаних повідомлень і системними сповіщеннями — без зайвого інтерфейсу.
+Компактний десктопний застосунок для роботи з Telegram, WhatsApp Web та будь-якими веб-сервісами в одному вікні. Вузька бічна панель (72 px) з перемикачем між джерелами, бейджами непрочитаних повідомлень і системними сповіщеннями — без зайвого інтерфейсу.
 
 Побудовано на **Tauri 2 + Vue 3 + TypeScript**.
+
+---
+
+## Функціональність
+
+- **Telegram і WhatsApp Web** — вбудовані як дочірні webview з окремими data store (незалежні сесії)
+- **Кастомні веб-шорткати** — додавайте будь-який сайт (Notion, Linear, Claude тощо) одним кліком; підтримується іконка зі списку або перша літера назви
+- **Бейджи непрочитаних** — лічильник зчитується з DOM/заголовка сторінки і відображається в панелі та трей-іконці
+- **Системні сповіщення** — push-сповіщення при нових повідомленнях (з cooldown 5 с, не показується при фокусі вікна)
+- **Глобальний хоткей** — Show/Hide вікна без мишки (за замовчуванням `⌘⇧S`, змінюється в налаштуваннях)
+- **Автозапуск при вході** — вмикається/вимикається в налаштуваннях
+- **Показ/приховання у Dock** — режим menu-bar-only через трей-меню
+- **Автоматичне оновлення** — перевіряє GitHub Releases при кожному запуску
 
 ---
 
@@ -40,12 +53,16 @@ xcode-select --install
 ```
 Signalist/                      # корінь git-репозиторію
 ├── signalist/                  # Tauri-проєкт
-│   ├── src/                    # Vue 3 + TypeScript (бічна панель)
-│   │   ├── App.vue             # головний компонент: панель, перемикач, налаштування
+│   ├── src/                    # Vue 3 + TypeScript (бічна панель + діалоги)
+│   │   ├── App.vue             # три view: sidebar, add-shortcut, edit-shortcut
+│   │   ├── assets/icons/       # SVG-іконки для кастомних шорткатів
 │   │   └── style.css           # Tailwind v4 + Catppuccin-палітра (@theme)
 │   └── src-tauri/
 │       ├── src/lib.rs          # вся логіка Rust: webview, команди, трей
-│       ├── inject/             # JS-скрипти для Telegram і WhatsApp webview
+│       ├── inject/
+│       │   ├── telegram.js     # JS-ін'єкція для Telegram webview
+│       │   ├── whatsapp.js     # JS-ін'єкція для WhatsApp webview
+│       │   └── shortcut.js     # JS-ін'єкція для кастомних шорткатів (anti-bot)
 │       ├── capabilities/       # дозволи Tauri (IPC)
 │       └── tauri.conf.json     # конфігурація застосунку, версія, updater
 ├── .github/
@@ -202,8 +219,8 @@ git push origin main --tags
 
 Логотип застосунку присутній у двох місцях:
 
-**1. Іконка у бічній панелі** (`src/assets/logo.png`):
-- замініть файл на власне зображення (рекомендований розмір: 512×512 px, PNG)
+**1. Іконка у бічній панелі** (`src/assets/logo.svg`):
+- замініть файл на власне SVG-зображення
 - Vue автоматично підхопить зміну при наступній збірці
 
 **2. Іконки системи** (трей, Dock, інсталятор) у `src-tauri/icons/`:
@@ -223,8 +240,8 @@ npm run tauri icon /шлях/до/вашого/logo-1024.png
 
 ## Додавання нового месенджера
 
-1. **`src-tauri/src/lib.rs`** — додайте запис у масив `MESSENGERS` з унікальним `data_store_id`.
-2. **`src-tauri/inject/<name>.js`** — створіть скрипт інʼєкції за зразком `telegram.js` або `whatsapp.js` (debounce + fetch-patch).
+1. **`src-tauri/src/lib.rs`** — додайте запис у масив `MESSENGERS` з унікальним `data_store_id` та `display_name`.
+2. **`src-tauri/inject/<name>.js`** — створіть скрипт ін'єкції за зразком `telegram.js` або `whatsapp.js` (debounce + fetch-patch для Tauri IPC).
 3. **`src-tauri/src/lib.rs`** — у функції `open_messenger` додайте гілку `match` для завантаження нового inject-скрипту.
-4. **`src/App.vue`** — додайте обʼєкт у масив `messengers` з `label`, `displayName` та іконкою з `lucide-vue-next`.
+4. **`src/App.vue`** — додайте об'єкт у масив `messengers` з полями `label`, `displayName` та `icon` (SVG-рядок; імпортуйте файл з `src/assets/icons/` або додайте новий).
 5. **`src-tauri/capabilities/messenger-ipc.json`** — додайте новий webview label і дозволені URL.

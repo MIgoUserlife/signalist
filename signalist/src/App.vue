@@ -18,9 +18,11 @@ const iconMap: Record<string, string> = Object.fromEntries(
     .filter(([key]) => key !== 'telegram' && key !== 'whatsapp')
 );
 
-const isDialogView = new URLSearchParams(window.location.search).get("view") === "add-shortcut";
-const isEditDialogView = new URLSearchParams(window.location.search).get("view") === "edit-shortcut";
-const editShortcutId = new URLSearchParams(window.location.search).get("id") ?? "";
+const _params = new URLSearchParams(window.location.search);
+const _view = _params.get("view");
+const isDialogView = _view === "add-shortcut";
+const isEditDialogView = _view === "edit-shortcut";
+const editShortcutId = _params.get("id") ?? "";
 
 // ── Shared state (used by both views) ──────────────────────────────────────
 interface CustomShortcut {
@@ -36,7 +38,7 @@ const addError = ref("");
 const isAdding = ref(false);
 const newShortcutIcon = ref<string | null>(null);
 
-async function submitAddShortcut() {
+async function submitShortcut(mode: "add" | "edit") {
   addError.value = "";
   const name = newShortcutName.value.trim();
   let url = newShortcutUrl.value.trim();
@@ -45,27 +47,10 @@ async function submitAddShortcut() {
   if (!/^https?:\/\//i.test(url)) url = "https://" + url;
   isAdding.value = true;
   try {
-    const sc = await invoke<CustomShortcut>("add_custom_shortcut", { name, url, icon: newShortcutIcon.value ?? null });
-    await emit("shortcut-added", sc);
-    await getCurrentWebviewWindow().close();
-  } catch (e) {
-    addError.value = String(e);
-  } finally {
-    isAdding.value = false;
-  }
-}
-
-async function submitEditShortcut() {
-  addError.value = "";
-  const name = newShortcutName.value.trim();
-  let url = newShortcutUrl.value.trim();
-  if (!name) { addError.value = "Name is required"; return; }
-  if (!url) { addError.value = "URL is required"; return; }
-  if (!/^https?:\/\//i.test(url)) url = "https://" + url;
-  isAdding.value = true;
-  try {
-    const sc = await invoke<CustomShortcut>("update_custom_shortcut", { id: editShortcutId, name, url, icon: newShortcutIcon.value ?? null });
-    await emit("shortcut-updated", sc);
+    const sc = mode === "add"
+      ? await invoke<CustomShortcut>("add_custom_shortcut", { name, url, icon: newShortcutIcon.value ?? null })
+      : await invoke<CustomShortcut>("update_custom_shortcut", { id: editShortcutId, name, url, icon: newShortcutIcon.value ?? null });
+    await emit(mode === "add" ? "shortcut-added" : "shortcut-updated", sc);
     await getCurrentWebviewWindow().close();
   } catch (e) {
     addError.value = String(e);
@@ -88,10 +73,9 @@ const messengers: MessengerConfig[] = [
   { label: "whatsapp", displayName: "WhatsApp", icon: whatsappIcon },
 ];
 
-const unreadCounts = reactive<Record<string, number>>({
-  telegram: 0,
-  whatsapp: 0,
-});
+const unreadCounts = reactive<Record<string, number>>(
+  Object.fromEntries(messengers.map(m => [m.label, 0]))
+);
 
 const currentHotkey = ref("Super+Shift+S");
 const isRecordingHotkey = ref(false);
@@ -116,10 +100,10 @@ watch(settingsOpen, (open) => {
 });
 
 const appVersion = ref("");
-
 const updateAvailable = ref(false);
 const updateVersion = ref("");
 const isInstalling = ref(false);
+let cachedUpdate: Awaited<ReturnType<typeof check>> | null = null;
 
 const customShortcuts = ref<CustomShortcut[]>([]);
 
@@ -180,9 +164,8 @@ function startRecordingHotkey() {
 async function installUpdate() {
   isInstalling.value = true;
   try {
-    const update = await check();
-    if (update?.available) {
-      await update.downloadAndInstall();
+    if (cachedUpdate?.available) {
+      await cachedUpdate.downloadAndInstall();
       await relaunch();
     }
   } catch (e) {
@@ -242,10 +225,7 @@ async function removeShortcut(id: string) {
   }
 }
 
-let unlisten: UnlistenFn | null = null;
-let unlistenActive: UnlistenFn | null = null;
-let unlistenShortcutAdded: UnlistenFn | null = null;
-let unlistenShortcutUpdated: UnlistenFn | null = null;
+const unlisteners: UnlistenFn[] = [];
 
 onMounted(async () => {
   if (isEditDialogView) {
@@ -287,26 +267,22 @@ onMounted(async () => {
     console.warn("Failed to load autostart state:", e);
   }
 
-  unlisten = await listen<{ messenger: string; count: number }>(
-    "unread-update",
-    (event) => {
+  unlisteners.push(
+    await listen<{ messenger: string; count: number }>("unread-update", (event) => {
       unreadCounts[event.payload.messenger] = event.payload.count;
-    },
+    }),
+    await listen<string>("active-messenger-changed", (event) => {
+      activeMessenger.value = event.payload;
+    }),
+    await listen<CustomShortcut>("shortcut-added", async (event) => {
+      customShortcuts.value.push(event.payload);
+      await openCustomShortcut(event.payload);
+    }),
+    await listen<CustomShortcut>("shortcut-updated", (event) => {
+      const idx = customShortcuts.value.findIndex(s => s.id === event.payload.id);
+      if (idx !== -1) customShortcuts.value[idx] = event.payload;
+    }),
   );
-
-  unlistenActive = await listen<string>("active-messenger-changed", (event) => {
-    activeMessenger.value = event.payload;
-  });
-
-  unlistenShortcutAdded = await listen<CustomShortcut>("shortcut-added", async (event) => {
-    customShortcuts.value.push(event.payload);
-    await openCustomShortcut(event.payload);
-  });
-
-  unlistenShortcutUpdated = await listen<CustomShortcut>("shortcut-updated", (event) => {
-    const idx = customShortcuts.value.findIndex(s => s.id === event.payload.id);
-    if (idx !== -1) customShortcuts.value[idx] = event.payload;
-  });
 
   try {
     appVersion.value = await getVersion();
@@ -315,10 +291,10 @@ onMounted(async () => {
   }
 
   try {
-    const update = await check();
-    if (update?.available) {
+    cachedUpdate = await check();
+    if (cachedUpdate?.available) {
       updateAvailable.value = true;
-      updateVersion.value = update.version;
+      updateVersion.value = cachedUpdate.version;
     }
   } catch (e) {
     console.warn("Update check failed:", e);
@@ -328,10 +304,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
-  unlisten?.();
-  unlistenActive?.();
-  unlistenShortcutAdded?.();
-  unlistenShortcutUpdated?.();
+  unlisteners.forEach(fn => fn());
   document.removeEventListener("click", onDocumentClick);
 });
 
@@ -360,12 +333,14 @@ if (!isDialogView && !isEditDialogView) {
 </script>
 
 <template>
-  <!-- ── Dialog view (Edit Web Shortcut window) ──────────────────────────── -->
+  <!-- ── Dialog view (Add / Edit Web Shortcut) ────────────────────────────── -->
   <div
-    v-if="isEditDialogView"
+    v-if="isDialogView || isEditDialogView"
     class="h-screen flex flex-col bg-surface p-5 gap-2 select-none"
   >
-    <h2 class="text-text-primary text-base font-semibold leading-none">Edit Web Shortcut</h2>
+    <h2 class="text-text-primary text-base font-semibold leading-none">
+      {{ isEditDialogView ? 'Edit Web Shortcut' : 'Add Web Shortcut' }}
+    </h2>
 
     <div class="flex flex-col gap-1">
       <label class="text-text-muted text-xs">Name</label>
@@ -376,7 +351,7 @@ if (!isDialogView && !isEditDialogView) {
         class="rounded-lg border border-glass-border bg-surface-hover px-3 py-2 text-sm text-text-primary outline-none focus:border-accent transition-colors"
         style="color-scheme: dark;"
         autofocus
-        @keydown.enter="submitEditShortcut"
+        @keydown.enter="submitShortcut(isEditDialogView ? 'edit' : 'add')"
         @keydown.esc="getCurrentWebviewWindow().close()"
       />
     </div>
@@ -389,7 +364,7 @@ if (!isDialogView && !isEditDialogView) {
         placeholder="https://linear.app"
         class="rounded-lg border border-glass-border bg-surface-hover px-3 py-2 text-sm text-text-primary outline-none focus:border-accent transition-colors"
         style="color-scheme: dark;"
-        @keydown.enter="submitEditShortcut"
+        @keydown.enter="submitShortcut(isEditDialogView ? 'edit' : 'add')"
         @keydown.esc="getCurrentWebviewWindow().close()"
       />
     </div>
@@ -426,79 +401,10 @@ if (!isDialogView && !isEditDialogView) {
         :class="isAdding ? 'bg-surface-active text-text-muted cursor-wait' : 'bg-accent text-surface hover:opacity-90'"
         class="px-4 py-2 rounded-lg text-sm font-medium cursor-pointer transition-colors"
         :disabled="isAdding"
-        @click="submitEditShortcut"
-      >{{ isAdding ? 'Saving…' : 'Save' }}</button>
-    </div>
-  </div>
-
-  <!-- ── Dialog view (Add Web Shortcut window) ────────────────────────────── -->
-  <div
-    v-else-if="isDialogView"
-    class="h-screen flex flex-col bg-surface p-5 gap-2 select-none"
-  >
-    <h2 class="text-text-primary text-base font-semibold leading-none">Add Web Shortcut</h2>
-
-    <div class="flex flex-col gap-1">
-      <label class="text-text-muted text-xs">Name</label>
-      <input
-        v-model="newShortcutName"
-        type="text"
-        placeholder="Linear"
-        class="rounded-lg border border-glass-border bg-surface-hover px-3 py-2 text-sm text-text-primary outline-none focus:border-accent transition-colors"
-        style="color-scheme: dark;"
-        autofocus
-        @keydown.enter="submitAddShortcut"
-        @keydown.esc="getCurrentWebviewWindow().close()"
-      />
-    </div>
-
-    <div class="flex flex-col gap-1">
-      <label class="text-text-muted text-xs">URL</label>
-      <input
-        v-model="newShortcutUrl"
-        type="text"
-        placeholder="https://linear.app"
-        class="rounded-lg border border-glass-border bg-surface-hover px-3 py-2 text-sm text-text-primary outline-none focus:border-accent transition-colors"
-        style="color-scheme: dark;"
-        @keydown.enter="submitAddShortcut"
-        @keydown.esc="getCurrentWebviewWindow().close()"
-      />
-    </div>
-
-    <div class="flex flex-col gap-1">
-      <label class="text-text-muted text-xs">Icon <span class="opacity-50">(optional)</span></label>
-      <div class="grid grid-cols-9 gap-1">
-        <button
-          v-for="(svg, key) in iconMap"
-          :key="key"
-          type="button"
-          :class="[
-            'h-8 w-8 flex items-center justify-center rounded-lg transition-all duration-100',
-            newShortcutIcon === key
-              ? 'bg-accent text-surface'
-              : 'bg-surface-hover text-text-muted hover:text-text-primary hover:bg-surface-active',
-          ]"
-          :title="key"
-          @click="newShortcutIcon = newShortcutIcon === key ? null : key"
-        >
-          <span class="flex h-4 w-4 [&>svg]:h-4 [&>svg]:w-4" v-html="svg" />
-        </button>
-      </div>
-    </div>
-
-    <p v-if="addError" class="text-[11px] text-red-400 -mt-2">{{ addError }}</p>
-
-    <div class="mt-auto flex gap-2 justify-end">
-      <button
-        class="px-4 py-2 rounded-lg text-sm text-text-muted hover:bg-surface-hover cursor-pointer transition-colors"
-        @click="getCurrentWebviewWindow().close()"
-      >Cancel</button>
-      <button
-        :class="isAdding ? 'bg-surface-active text-text-muted cursor-wait' : 'bg-accent text-surface hover:opacity-90'"
-        class="px-4 py-2 rounded-lg text-sm font-medium cursor-pointer transition-colors"
-        :disabled="isAdding"
-        @click="submitAddShortcut"
-      >{{ isAdding ? 'Adding…' : 'Add' }}</button>
+        @click="submitShortcut(isEditDialogView ? 'edit' : 'add')"
+      >
+        {{ isAdding ? (isEditDialogView ? 'Saving…' : 'Adding…') : (isEditDialogView ? 'Save' : 'Add') }}
+      </button>
     </div>
   </div>
 
