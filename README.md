@@ -9,9 +9,10 @@
 ## Функціональність
 
 - **Telegram і WhatsApp Web** — вбудовані як дочірні webview з окремими data store (незалежні сесії)
-- **Кастомні веб-шорткати** — додавайте будь-який сайт (Notion, Linear, Claude тощо) одним кліком; підтримується іконка зі списку або перша літера назви
+- **Каталог месенджерів** — додавайте Instagram, Facebook, Discord, Slack, Signal, LinkedIn, X одним кліком; зберігаються між сесіями
+- **Кастомні веб-шорткати** — будь-який сайт (Notion, Linear, Claude тощо); підтримується іконка зі списку або перша літера назви
 - **Бейджи непрочитаних** — лічильник зчитується з DOM/заголовка сторінки і відображається в панелі та трей-іконці
-- **Системні сповіщення** — push-сповіщення при нових повідомленнях (з cooldown 5 с, не показується при фокусі вікна)
+- **Системні сповіщення** — push-сповіщення при нових повідомленнях (з cooldown 5 с)
 - **Глобальний хоткей** — Show/Hide вікна без мишки (за замовчуванням `⌘⇧S`, змінюється в налаштуваннях)
 - **Автозапуск при вході** — вмикається/вимикається в налаштуваннях
 - **Показ/приховання у Dock** — режим menu-bar-only через трей-меню
@@ -29,7 +30,8 @@
 - [Випуск нової версії (Release)](#випуск-нової-версії-release)
 - [Автоматичне оновлення в застосунку](#автоматичне-оновлення-в-застосунку)
 - [Зміна логотипу](#зміна-логотипу)
-- [Додавання нового месенджера](#додавання-нового-месенджера)
+- [Додавання вбудованого месенджера](#додавання-вбудованого-месенджера)
+- [Changelog](#changelog)
 
 ---
 
@@ -54,20 +56,22 @@ xcode-select --install
 Signalist/                      # корінь git-репозиторію
 ├── signalist/                  # Tauri-проєкт
 │   ├── src/                    # Vue 3 + TypeScript (бічна панель + діалоги)
-│   │   ├── App.vue             # три view: sidebar, add-shortcut, edit-shortcut
-│   │   ├── assets/icons/       # SVG-іконки для кастомних шорткатів
+│   │   ├── App.vue             # views: sidebar, add-shortcut, edit-shortcut, add-messenger
+│   │   ├── messengerCatalog.ts # каталог сервісів для додавання (Instagram, Discord тощо)
+│   │   ├── assets/icons/       # SVG-іконки для шорткатів і месенджерів
 │   │   └── style.css           # Tailwind v4 + Catppuccin-палітра (@theme)
 │   └── src-tauri/
 │       ├── src/lib.rs          # вся логіка Rust: webview, команди, трей
 │       ├── inject/
 │       │   ├── telegram.js     # JS-ін'єкція для Telegram webview
 │       │   ├── whatsapp.js     # JS-ін'єкція для WhatsApp webview
-│       │   └── shortcut.js     # JS-ін'єкція для кастомних шорткатів (anti-bot)
+│       │   └── shortcut.js     # JS-ін'єкція для кастомних webview (anti-bot)
 │       ├── capabilities/       # дозволи Tauri (IPC)
 │       └── tauri.conf.json     # конфігурація застосунку, версія, updater
 ├── .github/
 │   └── workflows/
 │       └── release.yml         # CI/CD: автоматична збірка та публікація релізів
+├── CHANGELOG.md
 └── README.md
 ```
 
@@ -163,25 +167,20 @@ Public key: dW50cnVzdGVkIGNvbW1...
 
 ### Публікація нової версії
 
-**1. Оновіть версію** у `signalist/src-tauri/tauri.conf.json`:
+**1. Оновіть версію** у `signalist/package.json`, `signalist/src-tauri/tauri.conf.json` та `signalist/src-tauri/Cargo.toml`.
 
-```json
-{
-  "version": "0.2.0"
-}
-```
-
-**2. Закомітьте та створіть тег:**
+**2. Закомітьте, створіть тег і запушіть:**
 
 ```sh
-git add signalist/src-tauri/tauri.conf.json
-git commit -m "chore: bump version to 0.2.0"
-git tag v0.2.0
-git push origin main --tags
+git add signalist/package.json signalist/src-tauri/tauri.conf.json signalist/src-tauri/Cargo.toml
+git commit -m "chore: bump version to x.x.x"
+git tag vx.x.x
+git push origin main
+git push origin vx.x.x
 ```
 
 **3. GitHub Actions** автоматично:
-- зберає застосунок для macOS (universal), Windows і Linux
+- збирає застосунок для macOS (universal), Windows і Linux
 - підписує артефакти приватним ключем
 - публікує **Draft Release** з усіма файлами та `latest.json`
 
@@ -195,21 +194,7 @@ git push origin main --tags
 
 При кожному запуску Signalist у фоні перевіряє наявність нової версії на GitHub Releases.
 
-Якщо оновлення знайдено — у нижній частині бічної панелі з'являється кнопка **UPD** (блакитна, зі стрілкою вниз). Натисніть її, щоб завантажити та встановити оновлення. Застосунок автоматично перезапуститься.
-
-```
-┌──────┐
-│ logo │
-│ v0.1 │
-├──────┤
-│  TG  │
-│  WA  │
-├──────┤
-│ auto │
-│ key  │
-│ [↓]  │  ← з'являється при наявності оновлення
-└──────┘
-```
+Якщо оновлення знайдено — у нижній частині бічної панелі з'являється кнопка **UPD** (зі стрілкою вниз). Натисніть її, щоб завантажити та встановити оновлення. Застосунок автоматично перезапуститься.
 
 Оновлення підписані криптографічно — встановлюються лише артефакти, підписані вашим приватним ключем.
 
@@ -238,10 +223,18 @@ npm run tauri icon /шлях/до/вашого/logo-1024.png
 
 ---
 
-## Додавання нового месенджера
+## Додавання вбудованого месенджера
+
+Цей розділ стосується додавання **вбудованого** месенджера з підтримкою бейджів непрочитаних (як Telegram/WhatsApp). Для звичайних сервісів без лічильника — використовуйте кнопку "+" у бічній панелі.
 
 1. **`src-tauri/src/lib.rs`** — додайте запис у масив `MESSENGERS` з унікальним `data_store_id` та `display_name`.
 2. **`src-tauri/inject/<name>.js`** — створіть скрипт ін'єкції за зразком `telegram.js` або `whatsapp.js` (debounce + fetch-patch для Tauri IPC).
 3. **`src-tauri/src/lib.rs`** — у функції `open_messenger` додайте гілку `match` для завантаження нового inject-скрипту.
-4. **`src/App.vue`** — додайте об'єкт у масив `messengers` з полями `label`, `displayName` та `icon` (SVG-рядок; імпортуйте файл з `src/assets/icons/` або додайте новий).
+4. **`src/App.vue`** — додайте об'єкт у масив `messengers` з полями `label`, `displayName` та `icon`.
 5. **`src-tauri/capabilities/messenger-ipc.json`** — додайте новий webview label і дозволені URL.
+
+---
+
+## Changelog
+
+Детальна історія змін — у [CHANGELOG.md](./CHANGELOG.md).
