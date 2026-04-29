@@ -71,13 +71,9 @@
   function getDomCount() {
     const seen = new Set();
     let total = 0;
-    // All selectors that can match unread badges in Telegram Web.
-    // Folder/tab badges are filtered out by the node.closest() check below.
     const selectors = [
-      // Telegram Web A (current) — stable classes only
       '.ListItem.Chat .chat-badge-transition.shown span',
       '.chat-list .chat-badge-transition.shown span',
-      // Backward compat for older K version
       '.chat-list-item .badge',
       '.ListItem .chat-badge-transition span',
     ];

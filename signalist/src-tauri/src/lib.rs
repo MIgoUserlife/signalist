@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use serde::{Serialize, Deserialize};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -15,6 +15,12 @@ use tauri_plugin_store::StoreExt;
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 const SIDEBAR_WIDTH: f64 = 72.0;
+
+// How long the unread count must remain stable before we post a notification.
+// Coalesces rapid changes during Telegram's message-sync bursts so the value
+// shown in the macOS Notification Center reflects the settled count, not a
+// transient mid-sync spike that the sidebar later overwrites.
+const NOTIFY_DEBOUNCE_MS: u64 = 800;
 
 const CHROME_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -60,8 +66,20 @@ pub struct ActiveMessenger(pub Mutex<String>);
 #[derive(Default)]
 pub struct UnreadCounts(pub Mutex<HashMap<String, u32>>);
 
+#[derive(Default, Clone, Copy)]
+pub struct NotifyState {
+    // Highest count we have already shown in the Notification Center for this
+    // messenger. Reset to the current value when count drops, so the next rise
+    // is treated as a fresh notification trigger.
+    last_notified: u32,
+    // Monotonic generation. Bumped on every change; pending debounce tasks
+    // capture the gen at scheduling time and self-cancel when it no longer
+    // matches — i.e. when a newer value has arrived.
+    pending_gen: u64,
+}
+
 #[derive(Default)]
-pub struct LastNotified(pub Mutex<HashMap<String, (u32, Option<Instant>)>>);
+pub struct NotifyTracker(pub Mutex<HashMap<String, NotifyState>>);
 
 pub struct HotkeyConfig(pub Mutex<String>);
 
@@ -217,84 +235,147 @@ fn do_toggle_dock_icon(app: &AppHandle) {
 
 #[tauri::command]
 fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
-    let Some(config) = MESSENGERS.iter().find(|m| m.label == messenger.as_str()) else {
+    if !MESSENGERS.iter().any(|m| m.label == messenger.as_str()) {
         eprintln!("[Signalist] update_unread_count REJECTED unknown messenger: {}", messenger);
         return;
-    };
+    }
     let count = count.min(10_000);
     #[cfg(debug_assertions)]
     println!("[Signalist] update_unread_count CALLED for {} with count {}", messenger, count);
 
-    if let Some(state) = app.try_state::<UnreadCounts>() {
-        let mut map = state.0.lock().unwrap();
-        if map.get(&messenger).copied() == Some(count) {
+    let Some(unread_state) = app.try_state::<UnreadCounts>() else { return };
+    let previous_count = {
+        let mut map = unread_state.0.lock().unwrap();
+        let prev = map.get(&messenger).copied().unwrap_or(0);
+        if prev == count {
             return;
         }
         map.insert(messenger.clone(), count);
-    }
+        prev
+    };
 
     update_tray(&app);
-
     let _ = app.emit("unread-update", UnreadUpdatePayload { messenger: messenger.clone(), count });
 
-    if let Some(ln) = app.try_state::<LastNotified>() {
-        let (last_count, last_time) = {
-            let state = ln.0.lock().unwrap();
-            state.get(&messenger).copied().unwrap_or_default()
-        };
+    handle_notify_change(&app, &messenger, count, previous_count);
+}
 
-        // count dropped — reset baseline, no notification
-        if count == 0 || count < last_count {
-            ln.0.lock().unwrap().entry(messenger.clone()).or_default().0 = count;
+// Decide whether the change calls for a (debounced) notification, then either
+// schedule one or update the baseline accordingly.
+//
+// Behaviour matrix:
+//   count == 0 OR count < previous   → drop is genuine: cancel any pending
+//                                       notification and lower the baseline,
+//                                       no notification fired.
+//   count <= last_notified            → we already announced this value;
+//                                       nothing to do.
+//   otherwise (count rose)            → bump generation, spawn a debounce
+//                                       task. If another change arrives within
+//                                       the debounce window, the gen mismatch
+//                                       cancels the in-flight task and a new
+//                                       one is scheduled with the latest value.
+fn handle_notify_change(app: &AppHandle, messenger: &str, count: u32, previous_count: u32) {
+    let Some(tracker) = app.try_state::<NotifyTracker>() else { return };
+    let mut map = tracker.0.lock().unwrap();
+    let entry = map.entry(messenger.to_string()).or_default();
+
+    if count == 0 || count < previous_count {
+        entry.last_notified = count;
+        entry.pending_gen = entry.pending_gen.wrapping_add(1);
+        return;
+    }
+
+    if count <= entry.last_notified {
+        return;
+    }
+
+    entry.pending_gen = entry.pending_gen.wrapping_add(1);
+    let gen = entry.pending_gen;
+    drop(map);
+
+    let app_clone = app.clone();
+    let messenger_clone = messenger.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(NOTIFY_DEBOUNCE_MS));
+        fire_notification_if_stable(&app_clone, &messenger_clone, gen);
+    });
+}
+
+// Runs after the debounce window elapses. Reads the current settled count
+// from UnreadCounts and only fires a notification if (a) no newer change has
+// invalidated this generation, and (b) the value is still above the last
+// announced one. Updates last_notified atomically so a focused window doesn't
+// re-trigger the same notification once it loses focus.
+fn fire_notification_if_stable(app: &AppHandle, messenger: &str, gen: u64) {
+    let current_count = match app.try_state::<UnreadCounts>() {
+        Some(state) => state.0.lock().unwrap().get(messenger).copied().unwrap_or(0),
+        None => return,
+    };
+    if current_count == 0 {
+        return;
+    }
+
+    let display_name = MESSENGERS
+        .iter()
+        .find(|m| m.label == messenger)
+        .map(|c| c.display_name.to_string())
+        .unwrap_or_else(|| messenger.to_string());
+
+    {
+        let Some(tracker) = app.try_state::<NotifyTracker>() else { return };
+        let mut map = tracker.0.lock().unwrap();
+        let entry = map.entry(messenger.to_string()).or_default();
+        if entry.pending_gen != gen {
             return;
         }
-
-        let cooldown_ok = last_time
-            .map(|t: Instant| t.elapsed() >= Duration::from_secs(5))
-            .unwrap_or(true);
-
-        if count > last_count && cooldown_ok {
-            let window_focused = app
-                .get_window("main")
-                .and_then(|w| w.is_focused().ok())
-                .unwrap_or(false);
-
-            if window_focused {
-                ln.0.lock().unwrap().insert(messenger.clone(), (count, Some(Instant::now())));
-                return;
-            }
-
-            let body = if count == 1 {
-                "You have 1 unread message".to_string()
-            } else {
-                format!("You have {} unread messages", count)
-            };
-            let icon_path = app
-                .path()
-                .resolve("icons/icon.png", BaseDirectory::Resource)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            let mut builder = app
-                .notification()
-                .builder()
-                .title(format!("New message on {}", config.display_name))
-                .body(body);
-
-            if !icon_path.is_empty() {
-                builder = builder.icon(icon_path);
-            }
-
-            match builder.show() {
-                #[cfg(debug_assertions)]
-                Ok(()) => println!("[Signalist] Notification sent for {}", config.display_name),
-                #[cfg(not(debug_assertions))]
-                Ok(()) => {}
-                Err(e) => eprintln!("[Signalist] Notification failed for {}: {}", config.display_name, e),
-            }
-
-            ln.0.lock().unwrap().insert(messenger.clone(), (count, Some(Instant::now())));
+        if current_count <= entry.last_notified {
+            return;
         }
+        entry.last_notified = current_count;
+    }
+
+    // Baseline is now updated. If the user is looking at the app, suppress the
+    // OS notification — they can already see the count in the sidebar.
+    let window_focused = app
+        .get_window("main")
+        .and_then(|w| w.is_focused().ok())
+        .unwrap_or(false);
+    if window_focused {
+        return;
+    }
+
+    let body = if current_count == 1 {
+        "You have 1 unread message".to_string()
+    } else {
+        format!("You have {} unread messages", current_count)
+    };
+    let icon_path = app
+        .path()
+        .resolve("icons/icon.png", BaseDirectory::Resource)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let mut builder = app
+        .notification()
+        .builder()
+        .title(format!("New message on {}", display_name))
+        .body(body);
+    if !icon_path.is_empty() {
+        builder = builder.icon(icon_path);
+    }
+
+    match builder.show() {
+        #[cfg(debug_assertions)]
+        Ok(()) => println!(
+            "[Signalist] Notification sent for {} (count={})",
+            display_name, current_count
+        ),
+        #[cfg(not(debug_assertions))]
+        Ok(()) => {}
+        Err(e) => eprintln!(
+            "[Signalist] Notification failed for {}: {}",
+            display_name, e
+        ),
     }
 }
 
@@ -727,7 +808,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(ActiveMessenger(Mutex::new(String::new())))
         .manage(UnreadCounts::default())
-        .manage(LastNotified::default())
+        .manage(NotifyTracker::default())
         .manage(HotkeyConfig(Mutex::new(String::new())))
         .manage(DockHidden(Mutex::new(false)))
         .manage(CustomShortcuts(Mutex::new(Vec::new())))
