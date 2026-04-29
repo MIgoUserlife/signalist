@@ -75,7 +75,6 @@
       '.ListItem.Chat .chat-badge-transition.shown span',
       '.chat-list .chat-badge-transition.shown span',
       '.chat-list-item .badge',
-      '.ListItem .chat-badge-transition span',
     ];
 
     for (const selector of selectors) {
@@ -98,7 +97,11 @@
   function getUnreadCount() {
     const titleCount = getTitleCount();
     if (titleCount > 0) return titleCount;
-    return getDomCount();
+    const domCount = getDomCount();
+    // Guard: if DOM count is many times higher than lastCount while title is 0,
+    // it's a muted-badge artifact during a title transition, not a genuine increase.
+    if (lastCount > 0 && domCount > lastCount * 4) return 0;
+    return domCount;
   }
 
   function checkAndUpdate() {
