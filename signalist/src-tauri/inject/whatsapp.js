@@ -81,8 +81,6 @@
 
     // Strategy 1: aria-label "N unread message(s)" on the row (English WhatsApp)
     rows.forEach(row => {
-      if (seen.has(row)) return;
-      seen.add(row);
       const label = row.getAttribute('aria-label') || '';
       const match = label.match(/(\d+)\s+unread message/i);
       if (match) {
@@ -99,9 +97,9 @@
         if (!/^\d+$/.test(text)) continue;
         const num = parseInt(text, 10);
         if (num <= 0 || num > 9999) continue;
+        if (seen.has(span)) continue;
         const rect = span.getBoundingClientRect();
         if (rect.width < 1 || rect.height < 1 || rect.width > 60) continue;
-        if (seen.has(span)) continue;
         seen.add(span);
         total += num;
         break; // one badge per row
