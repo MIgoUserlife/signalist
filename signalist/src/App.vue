@@ -10,6 +10,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import logoIcon from './assets/logo.svg?raw';
 import telegramIcon from './assets/icons/telegram.svg?raw';
 import whatsappIcon from './assets/icons/whatsapp.svg?raw';
+import { MESSENGER_CATALOG, type CatalogEntry } from './messengerCatalog';
 
 const _allIconsRaw = import.meta.glob('./assets/icons/*.svg', { query: '?raw', import: 'default', eager: true }) as Record<string, string>;
 const iconMap: Record<string, string> = Object.fromEntries(
@@ -22,10 +23,18 @@ const _params = new URLSearchParams(window.location.search);
 const _view = _params.get("view");
 const isDialogView = _view === "add-shortcut";
 const isEditDialogView = _view === "edit-shortcut";
+const isAddMessengerView = _view === "add-messenger";
 const editShortcutId = _params.get("id") ?? "";
 
 // ── Shared state (used by both views) ──────────────────────────────────────
 interface CustomShortcut {
+  id: string;
+  name: string;
+  url: string;
+  icon?: string;
+}
+
+interface UserMessenger {
   id: string;
   name: string;
   url: string;
@@ -106,6 +115,8 @@ const isInstalling = ref(false);
 let cachedUpdate: Awaited<ReturnType<typeof check>> | null = null;
 
 const customShortcuts = ref<CustomShortcut[]>([]);
+const userMessengers = ref<UserMessenger[]>([]);
+const isAddingMessenger = ref(false);
 
 function shortcutInitial(name: string): string {
   return name.trim().charAt(0).toUpperCase() || "?";
@@ -203,6 +214,58 @@ async function loadCustomShortcuts() {
   }
 }
 
+async function loadUserMessengers() {
+  try {
+    userMessengers.value = await invoke<UserMessenger[]>("list_user_messengers");
+  } catch (e) {
+    console.warn("Failed to load user messengers:", e);
+  }
+}
+
+async function openUserMessenger(m: UserMessenger) {
+  await invoke("open_custom_shortcut", { id: m.id, url: m.url });
+  activeMessenger.value = shortcutLabel(m.id);
+}
+
+async function switchToUserMessenger(m: UserMessenger) {
+  activeMessenger.value = shortcutLabel(m.id);
+  try {
+    await invoke("switch_messenger", { messenger: shortcutLabel(m.id) });
+  } catch {
+    await openUserMessenger(m);
+  }
+}
+
+async function removeUserMessenger(id: string) {
+  await invoke("remove_user_messenger", { id });
+  userMessengers.value = userMessengers.value.filter(m => m.id !== id);
+  if (activeMessenger.value === shortcutLabel(id)) {
+    await openMessenger("telegram");
+  }
+}
+
+function isMessengerAdded(entry: CatalogEntry): boolean {
+  return userMessengers.value.some(m => m.url === entry.url);
+}
+
+async function addFromCatalog(entry: CatalogEntry) {
+  isAddingMessenger.value = true;
+  addError.value = "";
+  try {
+    const m = await invoke<UserMessenger>("add_user_messenger", {
+      name: entry.name,
+      url: entry.url,
+      icon: entry.icon,
+    });
+    await emit("messenger-added", m);
+    await getCurrentWebviewWindow().close();
+  } catch (e) {
+    addError.value = String(e);
+  } finally {
+    isAddingMessenger.value = false;
+  }
+}
+
 async function openCustomShortcut(sc: CustomShortcut) {
   await invoke("open_custom_shortcut", { id: sc.id, url: sc.url });
   activeMessenger.value = shortcutLabel(sc.id);
@@ -240,6 +303,11 @@ onMounted(async () => {
     } catch (e) {
       console.warn("Failed to load shortcut for editing:", e);
     }
+    return;
+  }
+
+  if (isAddMessengerView) {
+    await loadUserMessengers();
     return;
   }
 
@@ -282,6 +350,10 @@ onMounted(async () => {
       const idx = customShortcuts.value.findIndex(s => s.id === event.payload.id);
       if (idx !== -1) customShortcuts.value[idx] = event.payload;
     }),
+    await listen<UserMessenger>("messenger-added", async (event) => {
+      userMessengers.value.push(event.payload);
+      await openUserMessenger(event.payload);
+    }),
   );
 
   try {
@@ -301,6 +373,7 @@ onMounted(async () => {
   }
 
   await loadCustomShortcuts();
+  await loadUserMessengers();
 });
 
 onUnmounted(() => {
@@ -327,15 +400,53 @@ async function switchMessenger(label: string) {
   }
 }
 
-if (!isDialogView && !isEditDialogView) {
+if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
   openMessenger("telegram");
 }
 </script>
 
 <template>
+  <!-- ── Add Messenger view ─────────────────────────────────────────────── -->
+  <div
+    v-if="isAddMessengerView"
+    class="h-screen flex flex-col bg-surface p-5 gap-4 select-none"
+  >
+    <h2 class="text-text-primary text-base font-semibold leading-none">Add Messenger</h2>
+
+    <div class="grid grid-cols-2 gap-2">
+      <button
+        v-for="entry in MESSENGER_CATALOG"
+        :key="entry.name"
+        :disabled="isAddingMessenger || isMessengerAdded(entry)"
+        :class="[
+          'flex items-center gap-3 px-4 py-3 rounded-xl transition-colors',
+          isMessengerAdded(entry)
+            ? 'bg-surface text-text-muted cursor-not-allowed'
+            : 'bg-surface-hover text-text-primary hover:bg-surface-active cursor-pointer',
+          isAddingMessenger && !isMessengerAdded(entry) ? 'cursor-wait' : '',
+        ]"
+        @click="addFromCatalog(entry)"
+      >
+        <span v-if="iconMap[entry.icon]" class="flex h-6 w-6 shrink-0 [&>svg]:h-6 [&>svg]:w-6" v-html="iconMap[entry.icon]" />
+        <span v-else class="flex h-6 w-6 shrink-0 items-center justify-center text-accent text-sm font-bold">{{ entry.name[0] }}</span>
+        <span class="text-sm font-medium flex-1 text-left">{{ entry.name }}</span>
+        <svg v-if="isMessengerAdded(entry)" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 text-accent opacity-70"><path d="M20 6 9 17l-5-5"/></svg>
+      </button>
+    </div>
+
+    <p v-if="addError" class="text-[11px] text-red-400 -mt-2">{{ addError }}</p>
+
+    <div class="mt-auto flex justify-end">
+      <button
+        class="px-4 py-2 rounded-lg text-sm text-text-muted hover:bg-surface-hover cursor-pointer transition-colors"
+        @click="getCurrentWebviewWindow().close()"
+      >Cancel</button>
+    </div>
+  </div>
+
   <!-- ── Dialog view (Add / Edit Web Shortcut) ────────────────────────────── -->
   <div
-    v-if="isDialogView || isEditDialogView"
+    v-else-if="isDialogView || isEditDialogView"
     class="h-screen flex flex-col bg-surface p-5 gap-2 select-none"
   >
     <h2 class="text-text-primary text-base font-semibold leading-none">
@@ -423,6 +534,9 @@ if (!isDialogView && !isEditDialogView) {
 
       <div class="w-10 border-t border-glass-border" />
 
+      <!-- Scrollable middle: zones 2, 2.5, 3 -->
+      <div class="flex-1 overflow-y-auto scrollbar-hidden scroll-fade w-full flex flex-col items-center pb-2">
+
       <!-- Zone 2: Built-in messengers -->
       <div class="flex w-full flex-col items-center gap-2 px-2 pt-3">
         <div v-for="m in messengers" :key="m.label" class="relative">
@@ -448,7 +562,45 @@ if (!isDialogView && !isEditDialogView) {
         </div>
       </div>
 
-      <!-- Zone 2.5: Custom Shortcuts + Add button -->
+      <!-- Zone 2.5: User Messengers + Add Messenger button -->
+      <div class="flex w-full flex-col items-center gap-2 px-2 pt-3">
+        <div
+          v-for="m in userMessengers"
+          :key="m.id"
+          class="relative group"
+        >
+          <button
+            :class="[
+              'flex h-12 w-12 items-center justify-center rounded-xl text-sm font-semibold cursor-pointer transition-all duration-150',
+              activeMessenger === shortcutLabel(m.id)
+                ? 'bg-text-primary text-surface'
+                : 'bg-surface-hover text-text-muted hover:bg-surface-active hover:text-text-primary',
+            ]"
+            :title="m.name"
+            @click="switchToUserMessenger(m)"
+          >
+            <span v-if="m.icon && iconMap[m.icon]" class="flex h-6 w-6 [&>svg]:h-6 [&>svg]:w-6" v-html="iconMap[m.icon]" />
+            <template v-else>{{ shortcutInitial(m.name) }}</template>
+          </button>
+          <button
+            class="absolute -top-1 -right-1 hidden group-hover:flex items-center justify-center h-5 w-5 p-0 rounded-full bg-surface text-text-muted hover:bg-badge-bg hover:text-white text-sm line-height cursor-pointer"
+            title="Remove"
+            @click.stop="removeUserMessenger(m.id)"
+          >×</button>
+        </div>
+
+        <button
+          class="flex h-12 w-12 items-center justify-center rounded-xl border border-dashed border-glass-border cursor-pointer transition-all duration-150 text-text-muted hover:border-accent hover:text-accent bg-transparent"
+          title="Add messenger"
+          @click="invoke('open_add_messenger_window')"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 5v14M5 12h14"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Zone 3: Custom Shortcuts + Add button -->
       <div class="flex w-full flex-col items-center gap-2 px-2 pt-3">
         <div
           v-for="sc in customShortcuts"
@@ -487,8 +639,10 @@ if (!isDialogView && !isEditDialogView) {
         </button>
       </div>
 
-      <!-- Zone 3: Settings -->
-      <div class="mt-auto w-full flex flex-col items-center">
+      </div><!-- /scrollable middle -->
+
+      <!-- Zone 4: Settings -->
+      <div class="w-full flex flex-col items-center">
         <div class="w-10 border-t border-glass-border mb-1" />
 
         <!-- Settings gear + accordion panel wrapper -->

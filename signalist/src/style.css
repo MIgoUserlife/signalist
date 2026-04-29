@@ -25,6 +25,30 @@ body,
   color: var(--color-text-primary);
 }
 
+.scrollbar-hidden {
+  scrollbar-width: none;
+}
+.scrollbar-hidden::-webkit-scrollbar {
+  display: none;
+}
+
+.scroll-fade {
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent,
+    black 20px,
+    black calc(100% - 20px),
+    transparent
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent,
+    black 20px,
+    black calc(100% - 20px),
+    transparent
+  );
+}
+
 @supports (backdrop-filter: blur(20px)) {
   .glass {
     background: var(--color-glass-bg);
