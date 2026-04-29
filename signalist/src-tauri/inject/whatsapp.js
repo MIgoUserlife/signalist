@@ -60,9 +60,9 @@
   }
 
   function getTitleCount() {
-    const match = document.title.match(/^\(([\d\s,+]+)\)\s*[^\)]*$/);
+    const match = document.title.match(/^\((\d+)\)/);
     if (match) {
-      const num = parseInt(match[1].replace(/[\s,+]/g, ''), 10);
+      const num = parseInt(match[1], 10);
       return isNaN(num) ? 0 : num;
     }
     return 0;

@@ -641,6 +641,12 @@ fn hide_all_messengers(app: &AppHandle) {
 
 fn toggle_window(app: &AppHandle) {
     let Some(window) = app.get_window("main") else { return };
+    if window.is_fullscreen().unwrap_or(false) {
+        if !window.is_focused().unwrap_or(false) {
+            let _ = window.set_focus();
+        }
+        return;
+    }
     let visible = window.is_visible().unwrap_or(false);
     let focused = window.is_focused().unwrap_or(false);
     if visible && focused {
