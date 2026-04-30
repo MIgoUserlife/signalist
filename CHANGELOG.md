@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.4] — 2026-04-30
+
+### Виправлено
+- **Auto-update нарешті працює** — пакет `latest.json` тепер коректно генерується і публікується разом із релізом. До цього updater-артефакти `.app.tar.gz` і `.sig` зовсім не створювались, бо в `tauri.conf.json` був відсутній `bundle.createUpdaterArtifacts: true` — у Tauri 2.x updater-збірка стала opt-in
+- Pipeline збирає реліз одразу як публічний (`releaseDraft: false`), інакше `tauri-action` пропускає крок генерації `latest.json`
+
+### Змінено
+- CI публікує **лише macOS arm64** (`aarch64-apple-darwin`); попередні цілі universal/Linux/Windows прибрані. Universal-збірка викликала баг у `tauri-action`, який відкидав `.tar.gz`/`.sig` через невідповідність імен; arm64-only усуває цю гілку
+- GitHub Actions оновлено: `actions/checkout@v5`, `actions/setup-node@v5`, Node 22 LTS — прибрано попередження про застарілий Node 20
+
+### Примітка
+- Установка з v0.2.0 не може автоматично оновитись до 0.3.4: ключ підпису було змінено в гілці `0.3.x`, і v0.2.0 перевіряє підпис старим pubkey. Потрібно один раз встановити `Signalist_0.3.4_aarch64.dmg` вручну — далі авто-оновлення працюватиме
+- При першому запуску `.dmg` macOS показує «Програму пошкоджено». Це quarantine-атрибут від ненотаризованої збірки. Виправити: `xattr -cr /Applications/Signalist.app`
+
+---
+
 ## [0.3.0] — 2026-04-29
 
 ### Додано

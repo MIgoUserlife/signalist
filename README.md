@@ -40,7 +40,7 @@
 | Інструмент | Версія |
 |---|---|
 | [Rust](https://rustup.rs/) | stable |
-| [Node.js](https://nodejs.org/) | 20+ |
+| [Node.js](https://nodejs.org/) | 22+ |
 | [Tauri CLI](https://tauri.app/start/) | v2 (входить у `devDependencies`) |
 
 На macOS додатково потрібен Xcode Command Line Tools:
@@ -118,14 +118,23 @@ npm run tauri build
 
 ## Встановлення на інший комп'ютер
 
-1. Перейдіть до [Releases](https://github.com/MIgoUserlife/signalist/releases) на GitHub.
-2. Завантажте актуальний інсталятор для вашої платформи:
-   - **macOS** — `Signalist_x.x.x_universal.dmg`
-   - **Windows** — `Signalist_x.x.x_x64-setup.exe`
-   - **Linux** — `signalist_x.x.x_amd64.AppImage`
-3. Встановіть звичайним способом для вашої ОС.
+Наразі публікуються лише збірки для **macOS на Apple Silicon (arm64)**.
 
-Після встановлення застосунок самостійно перевірятиме наявність нових версій при кожному запуску.
+1. Перейдіть до [Releases](https://github.com/MIgoUserlife/signalist/releases) на GitHub.
+2. Завантажте актуальний `Signalist_x.x.x_aarch64.dmg`.
+3. Перетягніть `Signalist.app` у `/Applications`.
+
+### Швидкий фікс: «Програму пошкоджено, її не можна відкрити»
+
+Збірки **не нотаризовані** Apple, тож macOS Gatekeeper при першому запуску показує помилку про пошкодження. Це не справжнє пошкодження — це quarantine-атрибут, доданий браузером при завантаженні. Зніміть його одною командою:
+
+```sh
+xattr -cr /Applications/Signalist.app
+```
+
+Після цього застосунок запуститься нормально. Команду треба повторити лише при наступному ручному завантаженні `.dmg`. Авто-оновлення цього не потребують — застосунок сам качає файли в обхід quarantine.
+
+Після встановлення Signalist самостійно перевірятиме наявність нових версій при кожному запуску.
 
 ---
 
@@ -180,13 +189,13 @@ git push origin vx.x.x
 ```
 
 **3. GitHub Actions** автоматично:
-- збирає застосунок для macOS (universal), Windows і Linux
+- збирає застосунок для macOS на Apple Silicon (`aarch64-apple-darwin`)
 - підписує артефакти приватним ключем
-- публікує **Draft Release** з усіма файлами та `latest.json`
+- публікує реліз із `.dmg`, `.app.tar.gz`, `.app.tar.gz.sig` і `latest.json`
 
-**4. Опублікуйте Release** на GitHub: перейдіть у Releases → знайдіть чернетку → натисніть **Publish release**.
+Реліз публікується **одразу, не як чернетка** — інакше `tauri-action` пропускає крок генерації `latest.json`, і авто-оновлення не працює.
 
-Після публікації `latest.json` стане доступним за endpoint-ом updater'а і всі запущені застосунки отримають сповіщення про оновлення.
+> **Важливо:** для генерації updater-артефактів (`.tar.gz`/`.sig`) у `tauri.conf.json` має бути `bundle.createUpdaterArtifacts: true`. У Tauri 2.x без цього прапора bundler випускає лише `.app` і `.dmg`.
 
 ---
 
