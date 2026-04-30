@@ -662,21 +662,6 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
               class="absolute bottom-full left-0 w-full flex flex-col items-center gap-1 py-2 rounded-xl bg-surface border border-glass-border shadow-xl z-10"
             >
               <button
-                v-if="updateAvailable"
-                class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150 text-accent hover:bg-surface-hover"
-                :title="`Оновлення ${updateVersion} доступне — натисніть, щоб встановити`"
-                :disabled="isInstalling"
-                @click="installUpdate"
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 2v13M7 13l5 5 5-5"/><path d="M20 21H4"/>
-                </svg>
-                <span class="text-[9px] leading-none opacity-70 select-none font-medium">
-                  {{ isInstalling ? '···' : 'UPD' }}
-                </span>
-              </button>
-
-              <button
                 class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"
                 :class="autostartEnabled ? 'text-accent hover:bg-surface-hover' : 'text-text-muted hover:bg-surface-hover hover:text-text-primary'"
                 :title="autostartEnabled ? 'Автозапуск увімкнено — натисніть, щоб вимкнути' : 'Автозапуск вимкнено — натисніть, щоб увімкнути'"
@@ -729,6 +714,31 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
               <circle cx="12" cy="12" r="3"/>
             </svg>
           </button>
+
+          <!-- Update button — always visible when update is available -->
+          <Transition
+            enter-active-class="transition-all duration-200 ease-out"
+            enter-from-class="opacity-0 scale-90"
+            enter-to-class="opacity-100 scale-100"
+            leave-active-class="transition-all duration-150 ease-in"
+            leave-from-class="opacity-100 scale-100"
+            leave-to-class="opacity-0 scale-90"
+          >
+            <button
+              v-if="updateAvailable"
+              class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150 text-accent hover:bg-surface-hover"
+              :title="`Оновлення ${updateVersion} доступне — натисніть, щоб встановити`"
+              :disabled="isInstalling"
+              @click="installUpdate"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 2v13M7 13l5 5 5-5"/><path d="M20 21H4"/>
+              </svg>
+              <span class="text-[9px] leading-none opacity-70 select-none font-medium">
+                {{ isInstalling ? '···' : 'UPD' }}
+              </span>
+            </button>
+          </Transition>
         </div>
       </div>
     </nav>

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Signalist",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "identifier": "com.signalist.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -41,7 +41,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEUzQjNBNzlBQzVCOUY2RTQKUldUazlybkZtcWV6NHlZWFE2SFhZNmVWLzNpUU44blVGcENzdjhvcjEydm1RTmQ4RXlNQ2hUN3AK%",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3QTU4OEFDNDgxRjIyNDYKUldSR0loOUlySWlsUjA3Y095OXN2UmJWTTlGcXVmVmNadUlwVlpHZkF6d2hWczE2RzBCei8zRmkK",
       "endpoints": [
         "https://github.com/MIgoUserlife/signalist/releases/latest/download/latest.json"
       ]
