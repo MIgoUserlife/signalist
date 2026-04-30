@@ -41,7 +41,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3QTU4OEFDNDgxRjIyNDYKUldSR0loOUlySWlsUjA3Y095OXN2UmJWTTlGcXVmVmNadUlwVlpHZkF6d2hWczE2RzBCei8zRmkK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDcyQzk0MDdFNkU5RDQyNzkKUldSNVFwMXVma0RKY201M3pJaExRaWtMT1QycE9XOXczQjBkK0RXbXdxWkN0dE94dW5Nc0NsNksK",
       "endpoints": [
         "https://github.com/MIgoUserlife/signalist/releases/latest/download/latest.json"
       ]
