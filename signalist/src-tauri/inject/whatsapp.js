@@ -162,20 +162,20 @@
         document.querySelector('[aria-label="Chat list"]'),
       ];
 
-      for (const el of containers) {
-        if (el) {
-          new MutationObserver(debouncedCheckAndUpdate).observe(el, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['aria-label', 'class'],
-            characterData: true,
-          });
-          console.log('[Signalist Inject] whatsapp observer attached');
-          return true;
-        }
-      }
-      return false;
+      // Attach to the first container we find — these selectors often match
+      // overlapping nodes (e.g. #pane-side contains #side); attaching to all
+      // would create redundant observers that double-trigger callbacks.
+      const target = containers.find(Boolean);
+      if (!target) return false;
+      new MutationObserver(debouncedCheckAndUpdate).observe(target, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['aria-label', 'class'],
+        characterData: true,
+      });
+      console.log('[Signalist Inject] whatsapp observer attached');
+      return true;
     }
 
     if (!observeChatList()) {

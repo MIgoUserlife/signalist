@@ -72,10 +72,14 @@ pub struct NotifyState {
     // messenger. Reset to the current value when count drops, so the next rise
     // is treated as a fresh notification trigger.
     last_notified: u32,
-    // Monotonic generation. Bumped on every change; pending debounce tasks
-    // capture the gen at scheduling time and self-cancel when it no longer
-    // matches — i.e. when a newer value has arrived.
+    // Monotonic generation. Bumped on every change; the single in-flight
+    // debounce thread re-reads it after each sleep and either fires (if stable)
+    // or restarts the sleep (if a newer change arrived).
     pending_gen: u64,
+    // True while a debounce thread is sleeping for this messenger. Prevents
+    // spawning a fresh OS thread on every burst event — the in-flight thread
+    // simply sleeps another window if pending_gen advanced.
+    in_flight: bool,
 }
 
 #[derive(Default)]
@@ -102,6 +106,17 @@ impl CustomShortcut {
 
 fn custom_webview_label(id: &str) -> String {
     format!("custom-{}", id)
+}
+
+fn is_custom_label(label: &str) -> bool {
+    label.starts_with("custom-")
+}
+
+fn content_bounds(window_logical: LogicalSize<f64>) -> (LogicalPosition<f64>, LogicalSize<f64>) {
+    (
+        LogicalPosition::new(SIDEBAR_WIDTH, 0.0),
+        LogicalSize::new(window_logical.width - SIDEBAR_WIDTH, window_logical.height),
+    )
 }
 
 pub struct CustomShortcuts(pub Mutex<Vec<CustomShortcut>>);
@@ -327,23 +342,45 @@ fn handle_notify_change(app: &AppHandle, messenger: &str, count: u32, previous_c
     }
 
     entry.pending_gen = entry.pending_gen.wrapping_add(1);
-    let gen = entry.pending_gen;
+    if entry.in_flight {
+        // A debounce thread is already sleeping for this messenger; it will
+        // observe the bumped pending_gen on wake and restart its sleep window.
+        return;
+    }
+    entry.in_flight = true;
     drop(map);
 
     let app_clone = app.clone();
     let messenger_clone = messenger.to_string();
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(NOTIFY_DEBOUNCE_MS));
-        fire_notification_if_stable(&app_clone, &messenger_clone, gen);
+        let read_gen = || -> Option<u64> {
+            app_clone.try_state::<NotifyTracker>().map(|t| {
+                t.0.lock().unwrap().get(&messenger_clone).map(|s| s.pending_gen).unwrap_or(0)
+            })
+        };
+        loop {
+            let Some(gen_at_sleep) = read_gen() else { return };
+            std::thread::sleep(Duration::from_millis(NOTIFY_DEBOUNCE_MS));
+            let Some(gen_now) = read_gen() else { return };
+            if gen_now == gen_at_sleep {
+                break;
+            }
+        }
+        fire_notification_if_stable(&app_clone, &messenger_clone);
+        if let Some(tracker) = app_clone.try_state::<NotifyTracker>() {
+            if let Some(entry) = tracker.0.lock().unwrap().get_mut(&messenger_clone) {
+                entry.in_flight = false;
+            }
+        }
     });
 }
 
-// Runs after the debounce window elapses. Reads the current settled count
-// from UnreadCounts and only fires a notification if (a) no newer change has
-// invalidated this generation, and (b) the value is still above the last
-// announced one. Updates last_notified atomically so a focused window doesn't
-// re-trigger the same notification once it loses focus.
-fn fire_notification_if_stable(app: &AppHandle, messenger: &str, gen: u64) {
+// Runs after the debounce window has settled (no further pending_gen changes).
+// Reads the current count from UnreadCounts and fires a notification only if
+// the value is still above the last announced one. Updates last_notified
+// atomically so a focused window doesn't re-trigger the same notification once
+// it loses focus.
+fn fire_notification_if_stable(app: &AppHandle, messenger: &str) {
     let current_count = match app.try_state::<UnreadCounts>() {
         Some(state) => state.0.lock().unwrap().get(messenger).copied().unwrap_or(0),
         None => return,
@@ -362,9 +399,6 @@ fn fire_notification_if_stable(app: &AppHandle, messenger: &str, gen: u64) {
         let Some(tracker) = app.try_state::<NotifyTracker>() else { return };
         let mut map = tracker.0.lock().unwrap();
         let entry = map.entry(messenger.to_string()).or_default();
-        if entry.pending_gen != gen {
-            return;
-        }
         if current_count <= entry.last_notified {
             return;
         }
@@ -438,20 +472,20 @@ fn reposition_webviews(app: &AppHandle) {
         let _ = sidebar.set_size(LogicalSize::new(SIDEBAR_WIDTH, logical.height));
     }
 
-    let content_width = logical.width - SIDEBAR_WIDTH;
+    let (pos, size) = content_bounds(logical);
     for m in MESSENGERS {
         if let Some(webview) = app.get_webview(m.label) {
-            let _ = webview.set_position(LogicalPosition::new(SIDEBAR_WIDTH, 0.0));
-            let _ = webview.set_size(LogicalSize::new(content_width, logical.height));
+            let _ = webview.set_position(pos);
+            let _ = webview.set_size(size);
         }
     }
-    if let Some(state) = app.try_state::<CustomShortcuts>() {
-        let labels: Vec<String> = state.0.lock().unwrap().iter().map(|sc| sc.webview_label()).collect();
-        for label in &labels {
-            if let Some(webview) = app.get_webview(label) {
-                let _ = webview.set_position(LogicalPosition::new(SIDEBAR_WIDTH, 0.0));
-                let _ = webview.set_size(LogicalSize::new(content_width, logical.height));
-            }
+    // Hidden custom webviews stay at 0×0 to keep their IOSurface released
+    // (see hide_all_messengers); only the active one is resized here.
+    let active = app.state::<ActiveMessenger>().0.lock().unwrap().clone();
+    if is_custom_label(&active) {
+        if let Some(webview) = app.get_webview(&active) {
+            let _ = webview.set_position(pos);
+            let _ = webview.set_size(size);
         }
     }
 }
@@ -754,6 +788,11 @@ async fn open_custom_shortcut(
 
     if let Some(webview) = app.get_webview(&label) {
         hide_all_messengers(&app);
+        // Custom webviews are shrunk to 0×0 while hidden — restore before showing.
+        let window = app.get_window("main").ok_or("Main window not found")?;
+        let (pos, size) = content_bounds(get_logical_size(&window)?);
+        let _ = webview.set_position(pos);
+        let _ = webview.set_size(size);
         webview.show().map_err(|e| e.to_string())?;
         webview.set_focus().map_err(|e| e.to_string())?;
         *app.state::<ActiveMessenger>().0.lock().unwrap() = label.clone();
@@ -798,17 +837,26 @@ async fn open_custom_shortcut(
     Ok(format!("Created {}", label))
 }
 
+// On macOS, a hidden WKWebView keeps its IOSurface backing store allocated for
+// fast re-show — fine for one or two views, but with N custom shortcuts the
+// cumulative GPU pressure can starve WindowServer. For shortcuts/user messengers
+// (which don't run background tracking — their inject is shortcut.js, no unread
+// reporting), shrinking to 0×0 forces the compositor to drop the surface.
+// MESSENGERS (Telegram/WhatsApp) keep full size while hidden so their inject
+// scripts continue polling unread counts in the background.
 fn hide_all_messengers(app: &AppHandle) {
     for m in MESSENGERS {
         if let Some(webview) = app.get_webview(m.label) {
             let _ = webview.hide();
         }
     }
+    let zero = LogicalSize::new(0.0, 0.0);
     if let Some(state) = app.try_state::<UserMessengers>() {
         let labels: Vec<String> = state.0.lock().unwrap().iter().map(|m| m.webview_label()).collect();
         for label in &labels {
             if let Some(webview) = app.get_webview(label) {
                 let _ = webview.hide();
+                let _ = webview.set_size(zero);
             }
         }
     }
@@ -817,6 +865,7 @@ fn hide_all_messengers(app: &AppHandle) {
         for label in &labels {
             if let Some(webview) = app.get_webview(label) {
                 let _ = webview.hide();
+                let _ = webview.set_size(zero);
             }
         }
     }
