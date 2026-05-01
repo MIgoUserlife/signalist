@@ -47,6 +47,18 @@ const addError = ref("");
 const isAdding = ref(false);
 const newShortcutIcon = ref<string | null>(null);
 
+const QUICK_PRESETS = [
+  { name: 'Claude',        url: 'https://claude.ai/new',    icon: 'claude'      },
+  { name: 'ChatGPT',       url: 'https://chatgpt.com/',     icon: 'openai'      },
+  { name: 'Claude Design', url: 'https://claude.ai/design', icon: 'color_lens'  },
+] as const;
+
+function applyPreset(p: typeof QUICK_PRESETS[number]) {
+  newShortcutName.value = p.name;
+  newShortcutUrl.value  = p.url;
+  newShortcutIcon.value = p.icon;
+}
+
 async function submitShortcut(mode: "add" | "edit") {
   addError.value = "";
   const name = newShortcutName.value.trim();
@@ -452,6 +464,20 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
     <h2 class="text-text-primary text-base font-semibold leading-none">
       {{ isEditDialogView ? 'Edit Web Shortcut' : 'Add Web Shortcut' }}
     </h2>
+
+    <div v-if="isDialogView" class="flex gap-2">
+      <button
+        v-for="p in QUICK_PRESETS"
+        :key="p.name"
+        type="button"
+        class="flex flex-1 flex-col items-center gap-1 rounded-lg py-2 bg-surface-hover hover:bg-surface-active transition-colors cursor-pointer"
+        @click="applyPreset(p)"
+      >
+        <span v-if="iconMap[p.icon]" class="flex h-5 w-5 [&>svg]:h-5 [&>svg]:w-5 text-text-muted" v-html="iconMap[p.icon]" />
+        <span v-else class="text-[10px] font-bold text-text-muted leading-none">{{ p.name[0] }}</span>
+        <span class="text-[10px] text-text-muted leading-none">{{ p.name }}</span>
+      </button>
+    </div>
 
     <div class="flex flex-col gap-1">
       <label class="text-text-muted text-xs">Name</label>

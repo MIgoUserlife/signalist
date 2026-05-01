@@ -586,8 +586,8 @@ async fn open_add_shortcut_window(app: AppHandle) -> Result<(), String> {
         WebviewUrl::App("index.html?view=add-shortcut".into()),
     )
     .title("Add Web Shortcut")
-    .inner_size(360.0, 400.0)
-    .min_inner_size(360.0, 400.0)
+    .inner_size(360.0, 480.0)
+    .min_inner_size(360.0, 480.0)
     .resizable(false)
     .center()
     .build()
