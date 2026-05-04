@@ -4,6 +4,13 @@
 
 ---
 
+## [0.3.6] — 2026-05-04
+
+### Змінено
+- **Dev-збірка ізольована від release** — новий `src-tauri/tauri.dev.conf.json` overlay задає `identifier = com.signalist.app.dev` і `productName = "Signalist Dev"`. Dev і release більше не діляться `settings.json`, WebKit data stores (сесії Telegram/WhatsApp) та іншими даними застосунку. Команда запуску: `npm run tauri:dev`
+
+---
+
 ## [0.3.5] — 2026-05-04
 
 ### Додано
