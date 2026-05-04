@@ -1,0 +1,6 @@
+"$schema" = "../gen/schemas/schema.json"
+
+[[permission]]
+identifier = "allow-update-sidebar-theme"
+description = "Allows messenger webviews to report background color for sidebar theme detection."
+commands.allow = ["update_sidebar_theme_from_webview"]

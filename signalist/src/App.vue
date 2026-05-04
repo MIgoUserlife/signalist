@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, watch, onMounted, onUnmounted } from "vue";
+import { ref, reactive, computed, watch, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -109,6 +109,44 @@ const hotkeyError = ref("");
 const autostartEnabled = ref(false);
 const settingsOpen = ref(false);
 const settingsWrapper = ref<HTMLElement | null>(null);
+
+// ── Theme ──────────────────────────────────────────────────────────────────
+type ThemeMode = 'system' | 'light' | 'dark' | 'auto';
+const THEME_MODES: ThemeMode[] = ['system', 'light', 'dark', 'auto'];
+const themeMode = ref<ThemeMode>(
+  (localStorage.getItem('themeMode') as ThemeMode | null) ?? 'system'
+);
+const autoIsDark = ref(true);
+const systemIsDark = ref(window.matchMedia('(prefers-color-scheme: dark)').matches);
+
+const resolvedTheme = computed(() => {
+  if (themeMode.value === 'light') return 'light';
+  if (themeMode.value === 'dark') return 'dark';
+  if (themeMode.value === 'system') return systemIsDark.value ? 'dark' : 'light';
+  return autoIsDark.value ? 'dark' : 'light';
+});
+
+const themeModeLabel = computed(() => {
+  switch (themeMode.value) {
+    case 'light': return 'LITE';
+    case 'dark': return 'DARK';
+    case 'auto':  return 'AUTO';
+    default:      return 'SYS';
+  }
+});
+
+function cycleTheme() {
+  const i = THEME_MODES.indexOf(themeMode.value);
+  themeMode.value = THEME_MODES[(i + 1) % THEME_MODES.length];
+}
+
+watch(resolvedTheme, (t) => {
+  document.documentElement.setAttribute('data-theme', t);
+}, { immediate: true });
+
+watch(themeMode, (m) => {
+  localStorage.setItem('themeMode', m);
+});
 
 function onDocumentClick(e: MouseEvent) {
   if (settingsWrapper.value && !settingsWrapper.value.contains(e.target as Node)) {
@@ -370,7 +408,15 @@ onMounted(async () => {
       userMessengers.value.push(event.payload);
       await openUserMessenger(event.payload);
     }),
+    await listen<boolean>("theme-update", (event) => {
+      autoIsDark.value = event.payload;
+    }),
   );
+
+  const mq = window.matchMedia('(prefers-color-scheme: dark)');
+  const mqHandler = (e: MediaQueryListEvent) => { systemIsDark.value = e.matches; };
+  mq.addEventListener('change', mqHandler);
+  unlisteners.push(() => mq.removeEventListener('change', mqHandler));
 
   try {
     appVersion.value = await getVersion();
@@ -717,6 +763,32 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
                 <span class="text-[9px] leading-none opacity-70 select-none font-medium">
                   {{ isRecordingHotkey ? '···' : formatHotkeyDisplay(currentHotkey) }}
                 </span>
+              </button>
+
+              <!-- Theme mode button -->
+              <button
+                class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150 text-text-muted hover:bg-surface-hover hover:text-text-primary"
+                :title="`Тема: ${themeModeLabel} — натисніть, щоб змінити`"
+                @click="cycleTheme"
+              >
+                <!-- system -->
+                <svg v-if="themeMode === 'system'" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
+                </svg>
+                <!-- light -->
+                <svg v-else-if="themeMode === 'light'" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"/><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"/><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"/>
+                </svg>
+                <!-- dark -->
+                <svg v-else-if="themeMode === 'dark'" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+                </svg>
+                <!-- auto -->
+                <svg v-else xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/>
+                  <path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/>
+                </svg>
+                <span class="text-[9px] leading-none opacity-70 select-none font-medium">{{ themeModeLabel }}</span>
               </button>
             </div>
           </Transition>

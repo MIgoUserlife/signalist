@@ -288,6 +288,11 @@ fn do_toggle_dock_icon(app: &AppHandle) {
 }
 
 #[tauri::command]
+fn update_sidebar_theme_from_webview(app: AppHandle, is_dark: bool) {
+    let _ = app.emit("theme-update", is_dark);
+}
+
+#[tauri::command]
 fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
     if !MESSENGERS.iter().any(|m| m.label == messenger.as_str()) {
         eprintln!("[Signalist] update_unread_count REJECTED unknown messenger: {}", messenger);
@@ -971,6 +976,7 @@ pub fn run() {
             switch_messenger,
             close_messenger,
             get_active_messenger,
+            update_sidebar_theme_from_webview,
             update_unread_count,
             get_global_shortcut,
             set_global_shortcut,

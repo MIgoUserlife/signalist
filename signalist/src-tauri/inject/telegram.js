@@ -46,6 +46,21 @@
     return true;
   }
 
+  function detectAndReportTheme() {
+    const invoke = resolveInvoke();
+    if (!invoke) return;
+    const bg = getComputedStyle(document.documentElement).backgroundColor;
+    const m = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+    if (!m) return;
+    const lum = (0.299 * +m[1] + 0.587 * +m[2] + 0.114 * +m[3]) / 255;
+    const p = invoke('update_sidebar_theme_from_webview', { isDark: lum < 0.5 });
+    if (p && typeof p.then === 'function') p.then(function(){}, function(){});
+  }
+
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden) detectAndReportTheme();
+  });
+
   function invokeTauri(count) {
     _pendingCount = count; // always overwrite — we only care about the latest value
     if (tryFlush()) return;
@@ -188,6 +203,16 @@
       /* ignore */
     }
 
+    // 4. Observe <html> class/style for in-app theme changes.
+    try {
+      new MutationObserver(detectAndReportTheme).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-color-scheme'],
+      });
+    } catch (e) {
+      /* ignore */
+    }
+
     // 4. Safety net: re-check every 5s regardless of mutations — debounce coalesces rapid calls
     setInterval(debouncedCheckAndUpdate, 5000);
   }
@@ -226,10 +251,12 @@
       setupObservers();
       setTimeout(checkAndUpdate, 500);
       setTimeout(debouncedCheckAndUpdate, 3000);
+      setTimeout(detectAndReportTheme, 2000);
     });
   } else {
     setupObservers();
     setTimeout(checkAndUpdate, 500);
     setTimeout(debouncedCheckAndUpdate, 3000);
+    setTimeout(detectAndReportTheme, 2000);
   }
 })();

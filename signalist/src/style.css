@@ -31,6 +31,18 @@ html.sidebar-view #app {
   background: transparent;
 }
 
+[data-theme="light"] {
+  --color-glass-bg: rgba(242, 239, 235, 0.85);
+  --color-surface: #f2efe8;
+  --color-surface-hover: #e8e4dc;
+  --color-surface-active: #dcd8cf;
+  --color-text-primary: #1a1714;
+  --color-text-muted: #6b6560;
+  --color-accent: #3a7a3a;
+  --color-glass-border: rgba(58, 122, 58, 0.25);
+  --color-badge-text: #f2efe8;
+}
+
 .scrollbar-hidden {
   scrollbar-width: none;
 }
