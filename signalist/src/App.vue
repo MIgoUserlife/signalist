@@ -26,6 +26,10 @@ const isEditDialogView = _view === "edit-shortcut";
 const isAddMessengerView = _view === "add-messenger";
 const editShortcutId = _params.get("id") ?? "";
 
+if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
+  document.documentElement.classList.add('sidebar-view');
+}
+
 // ── Shared state (used by both views) ──────────────────────────────────────
 interface CustomShortcut {
   id: string;
@@ -548,7 +552,7 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
   <!-- ── Sidebar view ─────────────────────────────────────────────────────── -->
   <template v-else>
     <nav
-      class="glass fixed top-0 left-0 z-50 flex h-screen w-[72px] flex-col items-center gap-2 border-r border-glass-border select-none"
+      class="glass fixed top-0 left-0 z-50 flex h-screen w-[64px] flex-col items-center gap-2 border-r border-glass-border select-none"
     >
       <!-- Zone 1: Logo -->
       <div class="flex w-full flex-col items-center pt-3 pb-2">
@@ -564,19 +568,19 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
       <div class="flex-1 overflow-y-auto scrollbar-hidden scroll-fade w-full flex flex-col items-center pb-2">
 
       <!-- Zone 2: Built-in messengers -->
-      <div class="flex w-full flex-col items-center gap-2 px-2 pt-3">
+      <div class="flex w-full flex-col items-center gap-1 px-2 pt-3">
         <div v-for="m in messengers" :key="m.label" class="relative">
           <button
             :class="[
-              'group flex h-12 w-12 items-center justify-center rounded-xl border-none cursor-pointer transition-all duration-150',
+              'group flex h-10 w-10 items-center justify-center rounded-xl border-none cursor-pointer transition-all duration-150',
               activeMessenger === m.label
-                ? 'bg-text-primary text-surface-hover'
-                : 'bg-surface-hover text-text-muted hover:bg-surface-active hover:text-text-primary',
+                ? 'bg-glass-border text-accent'
+                : 'text-text-muted hover:bg-surface-hover',
             ]"
             :title="m.displayName"
             @click="switchMessenger(m.label)"
           >
-            <span class="flex h-6 w-6 items-center justify-center [&>svg]:h-6 [&>svg]:w-6" v-html="m.icon" />
+            <span class="flex h-5 w-5 items-center justify-center [&>svg]:h-5 [&>svg]:w-5" v-html="m.icon" />
           </button>
 
           <span
@@ -589,7 +593,7 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
       </div>
 
       <!-- Zone 2.5: User Messengers + Add Messenger button -->
-      <div class="flex w-full flex-col items-center gap-2 px-2 pt-3">
+      <div class="flex w-full flex-col items-center gap-1 px-2 pt-3">
         <div
           v-for="m in userMessengers"
           :key="m.id"
@@ -597,15 +601,15 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
         >
           <button
             :class="[
-              'flex h-12 w-12 items-center justify-center rounded-xl text-sm font-semibold cursor-pointer transition-all duration-150',
+              'flex h-10 w-10 items-center justify-center rounded-xl text-sm font-semibold cursor-pointer transition-all duration-150',
               activeMessenger === shortcutLabel(m.id)
-                ? 'bg-text-primary text-surface'
-                : 'bg-surface-hover text-text-muted hover:bg-surface-active hover:text-text-primary',
+                ? 'bg-glass-border text-accent'
+                : 'text-text-muted hover:bg-surface-hover',
             ]"
             :title="m.name"
             @click="switchToUserMessenger(m)"
           >
-            <span v-if="m.icon && iconMap[m.icon]" class="flex h-6 w-6 [&>svg]:h-6 [&>svg]:w-6" v-html="iconMap[m.icon]" />
+            <span v-if="m.icon && iconMap[m.icon]" class="flex h-5 w-5 [&>svg]:h-5 [&>svg]:w-5" v-html="iconMap[m.icon]" />
             <template v-else>{{ shortcutInitial(m.name) }}</template>
           </button>
           <button
@@ -616,7 +620,7 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
         </div>
 
         <button
-          class="flex h-12 w-12 items-center justify-center rounded-xl border border-dashed border-glass-border cursor-pointer transition-all duration-150 text-text-muted hover:border-accent hover:text-accent bg-transparent"
+          class="flex h-10 w-10 items-center justify-center rounded-xl border border-dashed border-glass-border cursor-pointer transition-all duration-150 text-text-muted hover:border-accent hover:text-accent bg-transparent"
           title="Add messenger"
           @click="invoke('open_add_messenger_window')"
         >
@@ -627,7 +631,7 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
       </div>
 
       <!-- Zone 3: Custom Shortcuts + Add button -->
-      <div class="flex w-full flex-col items-center gap-2 px-2 pt-3">
+      <div class="flex w-full flex-col items-center gap-1 px-2 pt-3">
         <div
           v-for="sc in customShortcuts"
           :key="sc.id"
@@ -635,16 +639,16 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
         >
           <button
             :class="[
-              'flex h-12 w-12 items-center justify-center rounded-xl text-sm font-semibold cursor-pointer transition-all duration-150',
+              'flex h-10 w-10 items-center justify-center rounded-xl text-sm font-semibold cursor-pointer transition-all duration-150',
               activeMessenger === shortcutLabel(sc.id)
-                ? 'bg-text-primary text-surface'
-                : 'bg-surface-hover text-text-muted hover:bg-surface-active hover:text-text-primary',
+                ? 'bg-glass-border text-accent'
+                : 'text-text-muted hover:bg-surface-hover',
             ]"
             :title="sc.name"
             @click="switchToCustom(sc)"
             @contextmenu.prevent="invoke('open_edit_shortcut_window', { id: sc.id })"
           >
-            <span v-if="sc.icon && iconMap[sc.icon]" class="flex h-6 w-6 [&>svg]:h-6 [&>svg]:w-6" v-html="iconMap[sc.icon]" />
+            <span v-if="sc.icon && iconMap[sc.icon]" class="flex h-5 w-5 [&>svg]:h-5 [&>svg]:w-5" v-html="iconMap[sc.icon]" />
             <template v-else>{{ shortcutInitial(sc.name) }}</template>
           </button>
           <button
@@ -655,7 +659,7 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
         </div>
 
         <button
-          class="flex h-12 w-12 items-center justify-center rounded-xl border border-dashed border-glass-border cursor-pointer transition-all duration-150 text-text-muted hover:border-accent hover:text-accent bg-transparent"
+          class="flex h-10 w-10 items-center justify-center rounded-xl border border-dashed border-glass-border cursor-pointer transition-all duration-150 text-text-muted hover:border-accent hover:text-accent bg-transparent"
           title="Add shortcut"
           @click="invoke('open_add_shortcut_window')"
         >
@@ -769,6 +773,6 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
       </div>
     </nav>
 
-    <main class="ml-[72px] h-screen" />
+    <main class="ml-[64px] h-screen" />
   </template>
 </template>

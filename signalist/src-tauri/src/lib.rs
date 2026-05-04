@@ -13,8 +13,10 @@ use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_store::StoreExt;
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+#[cfg(target_os = "macos")]
+use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
 
-const SIDEBAR_WIDTH: f64 = 72.0;
+const SIDEBAR_WIDTH: f64 = 64.0;
 
 // How long the unread count must remain stable before we post a notification.
 // Coalesces rapid changes during Telegram's message-sync bursts so the value
@@ -997,18 +999,24 @@ pub fn run() {
                 .min_inner_size(800.0, 600.0)
                 .resizable(true)
                 .decorations(true)
+                .transparent(true)
                 .build()?;
 
             let logical = get_logical_size(&window)?;
 
             let sidebar_builder =
-                WebviewBuilder::new("sidebar", WebviewUrl::App("index.html".into()));
+                WebviewBuilder::new("sidebar", WebviewUrl::App("index.html".into()))
+                    .transparent(true);
 
             window.add_child(
                 sidebar_builder,
                 LogicalPosition::new(0.0, 0.0),
                 LogicalSize::new(SIDEBAR_WIDTH, logical.height),
             )?;
+
+            #[cfg(target_os = "macos")]
+            apply_vibrancy(&window, NSVisualEffectMaterial::Sidebar, None, None)
+                .expect("Failed to apply vibrancy");
 
             let open_handle = handle.clone();
             tauri::async_runtime::spawn(async move {
