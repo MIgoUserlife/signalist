@@ -190,19 +190,20 @@ struct UnreadUpdatePayload {
     count: u32,
 }
 
-fn build_tray_menu(app: &AppHandle) -> Menu<tauri::Wry> {
+fn build_tray_menu(app: &AppHandle) -> Option<Menu<tauri::Wry>> {
     let counts = app.state::<UnreadCounts>().0.lock().unwrap().clone();
     let hotkey = app.state::<HotkeyConfig>().0.lock().unwrap().clone();
     let dock_hidden = *app.state::<DockHidden>().0.lock().unwrap();
 
-    let menu = Menu::new(app).unwrap();
+    let menu = Menu::new(app).ok()?;
 
     for m in MESSENGERS {
         let count = counts.get(m.label).copied().unwrap_or(0);
         let dot = if count > 0 { "◉" } else { "○" };
         let label = format!("{}  {}", dot, m.display_name);
-        let item = MenuItem::with_id(app, m.label, &label, true, None::<&str>).unwrap();
-        menu.append(&item).unwrap();
+        if let Ok(item) = MenuItem::with_id(app, m.label, &label, true, None::<&str>) {
+            let _ = menu.append(&item);
+        }
     }
 
     if let Some(state) = app.try_state::<UserMessengers>() {
@@ -212,8 +213,9 @@ fn build_tray_menu(app: &AppHandle) -> Menu<tauri::Wry> {
             .collect();
         for (webview_label, name) in &entries {
             let label = format!("○  {}", name);
-            let item = MenuItem::with_id(app, webview_label, &label, true, None::<&str>).unwrap();
-            menu.append(&item).unwrap();
+            if let Ok(item) = MenuItem::with_id(app, webview_label, &label, true, None::<&str>) {
+                let _ = menu.append(&item);
+            }
         }
     }
 
@@ -224,45 +226,38 @@ fn build_tray_menu(app: &AppHandle) -> Menu<tauri::Wry> {
             .collect();
         for (webview_label, name) in &shortcuts {
             let label = format!("○  {}", name);
-            let item = MenuItem::with_id(app, webview_label, &label, true, None::<&str>).unwrap();
-            menu.append(&item).unwrap();
+            if let Ok(item) = MenuItem::with_id(app, webview_label, &label, true, None::<&str>) {
+                let _ = menu.append(&item);
+            }
         }
     }
 
-    menu.append(&PredefinedMenuItem::separator(app).unwrap()).unwrap();
+    if let Ok(sep) = PredefinedMenuItem::separator(app) { let _ = menu.append(&sep); }
 
     let accel = hotkey.replace("Super", "Cmd");
-    let toggle_item = MenuItem::with_id(
-        app,
-        "toggle_window",
-        "⧉  Show/Hide",
-        true,
-        Some(accel.as_str()),
-    )
-    .unwrap();
-    menu.append(&toggle_item).unwrap();
+    if let Ok(toggle_item) = MenuItem::with_id(app, "toggle_window", "⧉  Show/Hide", true, Some(accel.as_str())) {
+        let _ = menu.append(&toggle_item);
+    }
 
-    menu.append(&PredefinedMenuItem::separator(app).unwrap()).unwrap();
+    if let Ok(sep) = PredefinedMenuItem::separator(app) { let _ = menu.append(&sep); }
 
-    let dock_label = if dock_hidden {
-        "▭  Show in Dock"
-    } else {
-        "▭  Hide in Dock"
-    };
-    let dock_item = MenuItem::with_id(app, "toggle_dock", dock_label, true, None::<&str>).unwrap();
-    menu.append(&dock_item).unwrap();
+    let dock_label = if dock_hidden { "▭  Show in Dock" } else { "▭  Hide in Dock" };
+    if let Ok(dock_item) = MenuItem::with_id(app, "toggle_dock", dock_label, true, None::<&str>) {
+        let _ = menu.append(&dock_item);
+    }
 
-    menu.append(&PredefinedMenuItem::separator(app).unwrap()).unwrap();
+    if let Ok(sep) = PredefinedMenuItem::separator(app) { let _ = menu.append(&sep); }
 
-    let quit_item = MenuItem::with_id(app, "quit", "⏻  Quit", true, Some("Cmd+Q")).unwrap();
-    menu.append(&quit_item).unwrap();
+    if let Ok(quit_item) = MenuItem::with_id(app, "quit", "⏻  Quit", true, Some("Cmd+Q")) {
+        let _ = menu.append(&quit_item);
+    }
 
-    menu
+    Some(menu)
 }
 
 fn update_tray(app: &AppHandle) {
     let Some(tray) = app.tray_by_id("main-tray") else { return };
-    let menu = build_tray_menu(app);
+    let Some(menu) = build_tray_menu(app) else { return };
     let _ = tray.set_menu(Some(menu));
     let total: u32 = app.state::<UnreadCounts>().0.lock().unwrap().values().sum();
     // template=true → dim (standard menu bar), template=false → bright (full color, visually active)
@@ -713,6 +708,7 @@ fn add_custom_shortcut(app: AppHandle, name: String, url: String, icon: Option<S
     app.state::<CustomShortcuts>().0.lock().unwrap().push(sc.clone());
     persist_custom_shortcuts(&app)?;
     update_tray(&app);
+    let _ = app.emit("shortcut-added", sc.clone());
     Ok(sc)
 }
 
@@ -1065,7 +1061,7 @@ pub fn run() {
                 .expect("Failed to register global shortcut");
 
             // Build tray icon
-            let tray_menu = build_tray_menu(app.handle());
+            let tray_menu = build_tray_menu(app.handle()).expect("Failed to build tray menu");
             let icon = app.default_window_icon().cloned()
                 .expect("No default window icon");
 

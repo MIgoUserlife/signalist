@@ -72,10 +72,11 @@ async function submitShortcut(mode: "add" | "edit") {
   if (!/^https?:\/\//i.test(url)) url = "https://" + url;
   isAdding.value = true;
   try {
-    const sc = mode === "add"
-      ? await invoke<CustomShortcut>("add_custom_shortcut", { name, url, icon: newShortcutIcon.value ?? null })
-      : await invoke<CustomShortcut>("update_custom_shortcut", { id: editShortcutId, name, url, icon: newShortcutIcon.value ?? null });
-    await emit(mode === "add" ? "shortcut-added" : "shortcut-updated", sc);
+    if (mode === "add") {
+      await invoke<CustomShortcut>("add_custom_shortcut", { name, url, icon: newShortcutIcon.value ?? null });
+    } else {
+      await invoke<CustomShortcut>("update_custom_shortcut", { id: editShortcutId, name, url, icon: newShortcutIcon.value ?? null });
+    }
     await getCurrentWebviewWindow().close();
   } catch (e) {
     addError.value = String(e);
