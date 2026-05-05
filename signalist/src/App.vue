@@ -24,9 +24,10 @@ const _view = _params.get("view");
 const isDialogView = _view === "add-shortcut";
 const isEditDialogView = _view === "edit-shortcut";
 const isAddMessengerView = _view === "add-messenger";
+const isBugReportView = _view === "bug-report";
 const editShortcutId = _params.get("id") ?? "";
 
-if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
+if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportView) {
   document.documentElement.classList.add('sidebar-view');
 }
 
@@ -345,7 +346,44 @@ async function removeShortcut(id: string) {
 
 const unlisteners: UnlistenFn[] = [];
 
+const bugReportLogs = ref("");
+const bugReportLoading = ref(false);
+const bugReportCopied = ref(false);
+
+async function loadBugReportLogs() {
+  bugReportLoading.value = true;
+  try {
+    bugReportLogs.value = await invoke<string>("get_recent_logs", { lines: 200 });
+  } catch (e) {
+    bugReportLogs.value = `Failed to load logs: ${String(e)}`;
+  } finally {
+    bugReportLoading.value = false;
+  }
+}
+
+async function copyLogs() {
+  await navigator.clipboard.writeText(bugReportLogs.value);
+  bugReportCopied.value = true;
+  setTimeout(() => { bugReportCopied.value = false; }, 2000);
+}
+
+function openGithubIssue() {
+  const body = encodeURIComponent(
+    `**Describe the bug**\n\n<!-- What happened? -->\n\n**App version**\n${appVersion.value || 'unknown'}\n\n**Recent logs**\n\`\`\`\n${bugReportLogs.value.slice(-3000)}\n\`\`\``
+  );
+  window.open(
+    `https://github.com/laskarzhevsky/signalist/issues/new?labels=bug&title=Bug+report&body=${body}`,
+    "_blank"
+  );
+}
+
 onMounted(async () => {
+  if (isBugReportView) {
+    try { appVersion.value = await getVersion(); } catch {}
+    await loadBugReportLogs();
+    return;
+  }
+
   if (isEditDialogView) {
     try {
       const shortcuts = await invoke<CustomShortcut[]>("list_custom_shortcuts");
@@ -463,7 +501,7 @@ async function switchMessenger(label: string) {
   }
 }
 
-if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
+if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportView) {
   openMessenger("telegram");
 }
 </script>
@@ -505,6 +543,46 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
         @click="getCurrentWebviewWindow().close()"
       >Cancel</button>
     </div>
+  </div>
+
+  <!-- ── Bug Report view ──────────────────────────────────────────────────── -->
+  <div
+    v-else-if="isBugReportView"
+    class="h-screen flex flex-col bg-surface p-5 gap-3 select-none"
+  >
+    <div class="flex items-center justify-between">
+      <h2 class="text-text-primary text-base font-semibold leading-none">Bug Report</h2>
+      <span v-if="appVersion" class="text-[11px] text-text-muted opacity-60">v{{ appVersion }}</span>
+    </div>
+    <p class="text-[11px] text-text-muted leading-relaxed">
+      Review the logs below. Nothing is sent automatically — you decide what to include.
+    </p>
+    <div class="relative flex-1 min-h-0">
+      <div v-if="bugReportLoading" class="flex items-center justify-center h-full text-text-muted text-sm">
+        Loading logs…
+      </div>
+      <textarea
+        v-else
+        :value="bugReportLogs"
+        readonly
+        class="w-full h-full resize-none rounded-lg border border-glass-border bg-surface-hover px-3 py-2 text-[11px] text-text-muted font-mono outline-none leading-relaxed"
+        style="color-scheme: dark;"
+      />
+    </div>
+    <div class="flex gap-2">
+      <button
+        class="flex-1 px-3 py-2 rounded-lg text-sm text-text-muted hover:bg-surface-hover cursor-pointer transition-colors border border-glass-border"
+        @click="copyLogs"
+      >{{ bugReportCopied ? 'Copied!' : 'Copy logs' }}</button>
+      <button
+        class="flex-1 px-3 py-2 rounded-lg text-sm font-medium bg-accent text-surface hover:opacity-90 cursor-pointer transition-colors"
+        @click="openGithubIssue"
+      >Open GitHub Issue</button>
+    </div>
+    <button
+      class="text-[11px] text-text-muted hover:text-text-primary cursor-pointer text-center transition-colors"
+      @click="getCurrentWebviewWindow().close()"
+    >Cancel</button>
   </div>
 
   <!-- ── Dialog view (Add / Edit Web Shortcut) ────────────────────────────── -->
@@ -790,6 +868,23 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView) {
                   <path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/>
                 </svg>
                 <span class="text-[9px] leading-none opacity-70 select-none font-medium">{{ themeModeLabel }}</span>
+              </button>
+
+              <!-- Bug report button -->
+              <button
+                class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150 text-text-muted hover:bg-surface-hover hover:text-text-primary"
+                title="Report a bug"
+                @click="invoke('open_bug_report_window')"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="8" y="6" width="8" height="14" rx="2"/>
+                  <path d="M8 10H5a1 1 0 0 0-1 1v2a1 1 0 0 0 1 1h3"/>
+                  <path d="M16 10h3a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1h-3"/>
+                  <path d="M8 6l-2-3"/>
+                  <path d="M16 6l2-3"/>
+                  <path d="M12 6V3"/>
+                </svg>
+                <span class="text-[9px] leading-none opacity-70 select-none font-medium">BUG</span>
               </button>
             </div>
           </Transition>

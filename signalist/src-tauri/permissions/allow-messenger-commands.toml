@@ -21,4 +21,7 @@ commands.allow = [
   "add_user_messenger",
   "remove_user_messenger",
   "open_add_messenger_window",
+  "get_recent_logs",
+  "log_js_error",
+  "open_bug_report_window",
 ]

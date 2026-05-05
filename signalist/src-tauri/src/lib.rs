@@ -290,12 +290,11 @@ fn update_sidebar_theme_from_webview(app: AppHandle, is_dark: bool) {
 #[tauri::command]
 fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
     if !MESSENGERS.iter().any(|m| m.label == messenger.as_str()) {
-        eprintln!("[Signalist] update_unread_count REJECTED unknown messenger: {}", messenger);
+        log::warn!("[update_unread_count] REJECTED unknown messenger: {}", messenger);
         return;
     }
     let count = count.min(10_000);
-    #[cfg(debug_assertions)]
-    println!("[Signalist] update_unread_count CALLED for {} with count {}", messenger, count);
+    log::debug!("[update_unread_count] CALLED for {} with count {}", messenger, count);
 
     let Some(unread_state) = app.try_state::<UnreadCounts>() else { return };
     let previous_count = {
@@ -438,17 +437,8 @@ fn fire_notification_if_stable(app: &AppHandle, messenger: &str) {
     }
 
     match builder.show() {
-        #[cfg(debug_assertions)]
-        Ok(()) => println!(
-            "[Signalist] Notification sent for {} (count={})",
-            display_name, current_count
-        ),
-        #[cfg(not(debug_assertions))]
-        Ok(()) => {}
-        Err(e) => eprintln!(
-            "[Signalist] Notification failed for {}: {}",
-            display_name, e
-        ),
+        Ok(()) => log::debug!("Notification sent for {} (count={})", display_name, current_count),
+        Err(e) => log::error!("Notification failed for {}: {}", display_name, e),
     }
 }
 
@@ -782,6 +772,45 @@ async fn open_add_messenger_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_recent_logs(app: AppHandle, lines: u32) -> Result<String, String> {
+    let log_dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
+    let log_path = log_dir.join("signalist.log");
+    if !log_path.exists() {
+        return Ok("No log file found yet.".to_string());
+    }
+    let content = std::fs::read_to_string(&log_path).map_err(|e| e.to_string())?;
+    let collected: Vec<&str> = content.lines().collect();
+    let start = collected.len().saturating_sub(lines as usize);
+    Ok(collected[start..].join("\n"))
+}
+
+#[tauri::command]
+fn log_js_error(source: String, message: String, stack: String) {
+    log::error!("[JS:{}] {} | stack: {}", source, message, stack);
+}
+
+#[tauri::command]
+async fn open_bug_report_window(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("bug-report") {
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(
+        &app,
+        "bug-report",
+        WebviewUrl::App("index.html?view=bug-report".into()),
+    )
+    .title("Bug Report")
+    .inner_size(560.0, 420.0)
+    .min_inner_size(400.0, 320.0)
+    .resizable(true)
+    .center()
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn open_custom_shortcut(
     app: AppHandle,
     id: String,
@@ -951,9 +980,47 @@ fn set_global_shortcut(
     Ok(())
 }
 
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = info.to_string();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let line = format!("[PANIC {}] {}\n", ts, msg);
+        eprintln!("{}", line.trim());
+        if let Ok(home) = std::env::var("HOME") {
+            let dir = std::path::PathBuf::from(home).join("Library/Logs/com.signalist.app");
+            let _ = std::fs::create_dir_all(&dir);
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("crash.log"))
+            {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    install_panic_hook();
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stderr),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("signalist".to_string()),
+                    }),
+                ])
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+                .max_file_size(5_000_000)
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -990,6 +1057,9 @@ pub fn run() {
             add_user_messenger,
             remove_user_messenger,
             open_add_messenger_window,
+            get_recent_logs,
+            log_js_error,
+            open_bug_report_window,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -1017,8 +1087,9 @@ pub fn run() {
             )?;
 
             #[cfg(target_os = "macos")]
-            apply_vibrancy(&window, NSVisualEffectMaterial::Sidebar, None, None)
-                .expect("Failed to apply vibrancy");
+            if let Err(e) = apply_vibrancy(&window, NSVisualEffectMaterial::Sidebar, None, None) {
+                log::warn!("Vibrancy unavailable: {}", e);
+            }
 
             let open_handle = handle.clone();
             tauri::async_runtime::spawn(async move {
@@ -1032,6 +1103,7 @@ pub fn run() {
             });
 
             let store = app.handle().store("settings.json")
+                .map_err(|e| { log::error!("Failed to open settings store: {}", e); e })
                 .expect("Failed to open settings store");
             let saved_hotkey = store
                 .get("hotkey")
@@ -1058,12 +1130,17 @@ pub fn run() {
                         toggle_window(app_handle);
                     }
                 })
-                .expect("Failed to register global shortcut");
+                .unwrap_or_else(|e| { log::error!("Failed to register global shortcut '{}': {}", saved_hotkey, e); });
 
             // Build tray icon
-            let tray_menu = build_tray_menu(app.handle()).expect("Failed to build tray menu");
-            let icon = app.default_window_icon().cloned()
-                .expect("No default window icon");
+            let Some(tray_menu) = build_tray_menu(app.handle()) else {
+                log::error!("Failed to build tray menu");
+                return Ok(());
+            };
+            let Some(icon) = app.default_window_icon().cloned() else {
+                log::error!("No default window icon found");
+                return Ok(());
+            };
 
             TrayIconBuilder::with_id("main-tray")
                 .icon(icon)
