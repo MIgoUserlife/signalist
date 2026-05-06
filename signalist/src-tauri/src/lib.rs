@@ -152,14 +152,14 @@ fn is_google_domain(domain: &str) -> bool {
         || d.ends_with(".youtube.com")
 }
 
-fn domain_to_data_store_id(domain: &str) -> [u8; 16] {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in domain.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+fn shortcut_id_to_data_store_id(shortcut_id: &str) -> [u8; 16] {
+    let mut result = [0u8; 16];
+    for (i, chunk) in shortcut_id.as_bytes().chunks(2).take(8).enumerate() {
+        if let Ok(s) = std::str::from_utf8(chunk) {
+            result[i] = u8::from_str_radix(s, 16).unwrap_or(0);
+        }
     }
-    let h = hash.to_le_bytes();
-    [0xCC, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 0, 0, 0, 0, 0, 0, 0]
+    result
 }
 
 fn generate_shortcut_id() -> String {
@@ -837,7 +837,7 @@ async fn open_custom_shortcut(
     if is_google_domain(&origin_host) {
         return Err("Google services are not supported in the embedded window. Please delete this shortcut and open the website in your browser.".into());
     }
-    let data_store_id = domain_to_data_store_id(&origin_host);
+    let data_store_id = shortcut_id_to_data_store_id(&id);
 
     let nav_guard = move |nav_url: &tauri::Url| -> bool {
         matches!(nav_url.scheme(), "https" | "http")
