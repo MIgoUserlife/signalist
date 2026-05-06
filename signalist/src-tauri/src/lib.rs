@@ -152,6 +152,24 @@ fn is_google_domain(domain: &str) -> bool {
         || d.ends_with(".youtube.com")
 }
 
+fn open_in_chrome(url: &str) {
+    let _ = std::process::Command::new("open")
+        .arg("-a")
+        .arg("Google Chrome")
+        .arg(url)
+        .spawn();
+}
+
+#[tauri::command]
+fn open_in_browser(url: String) -> Result<(), String> {
+    let parsed: tauri::Url = url.parse().map_err(|_| "Invalid URL".to_string())?;
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return Err("Only HTTP/HTTPS URLs are supported".into());
+    }
+    open_in_chrome(&url);
+    Ok(())
+}
+
 fn shortcut_id_to_data_store_id(shortcut_id: &str) -> [u8; 16] {
     let mut result = [0u8; 16];
     for (i, chunk) in shortcut_id.as_bytes().chunks(2).take(8).enumerate() {
@@ -512,9 +530,13 @@ async fn open_messenger(app: AppHandle, messenger: String) -> Result<String, Str
     let allowed_domains = config.allowed_domains.to_vec();
     let nav_guard = move |url: &tauri::Url| -> bool {
         if let Some(host) = url.host_str() {
-            allowed_domains
+            let is_allowed = allowed_domains
                 .iter()
-                .any(|d| host == *d || host.ends_with(&format!(".{}", d)))
+                .any(|d| host == *d || host.ends_with(&format!(".{}", d)));
+            if !is_allowed && matches!(url.scheme(), "https" | "http") {
+                open_in_chrome(url.as_str());
+            }
+            is_allowed
         } else {
             false
         }
@@ -1060,6 +1082,7 @@ pub fn run() {
             get_recent_logs,
             log_js_error,
             open_bug_report_window,
+            open_in_browser,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

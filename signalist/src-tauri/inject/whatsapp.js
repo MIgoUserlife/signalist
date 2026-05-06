@@ -26,6 +26,30 @@
     return null;
   }
 
+  (function patchWindowOpen() {
+    const _open = window.open.bind(window);
+    window.open = function (url, target, features) {
+      if (typeof url === 'string' && /^https?:\/\//i.test(url)) {
+        try {
+          const parsed = new URL(url);
+          if (parsed.origin !== location.origin) {
+            function tryInvoke() {
+              const invoke = resolveInvoke();
+              if (invoke) {
+                invoke('open_in_browser', { url: url }).catch(() => {});
+              } else {
+                setTimeout(tryInvoke, 100);
+              }
+            }
+            tryInvoke();
+            return null;
+          }
+        } catch (_) {}
+      }
+      return _open(url, target, features);
+    };
+  })();
+
   function tryFlush() {
     const invoke = resolveInvoke();
     if (!invoke) return false;

@@ -1,0 +1,8 @@
+"$schema" = "../gen/schemas/schema.json"
+
+[[permission]]
+identifier = "allow-open-in-browser"
+description = "Allows webviews to open external URLs in the system browser."
+commands.allow = [
+  "open_in_browser",
+]

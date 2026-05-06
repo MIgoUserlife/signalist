@@ -15,6 +15,7 @@
   "permissions": [
     "core:default",
     "allow-update-unread-count",
-    "allow-update-sidebar-theme"
+    "allow-update-sidebar-theme",
+    "allow-open-in-browser"
   ]
 }
