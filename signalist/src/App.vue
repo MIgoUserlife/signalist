@@ -31,6 +31,13 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportVie
   document.documentElement.classList.add('sidebar-view');
 }
 
+// Defer window.close() to the next tick. Synchronous close() from a JS event
+// handler crashes WKWebView on macOS 26 in WebPageProxy::dispatchSetObscuredContentInsets
+// because a runloop work item still references the now-freed page proxy.
+function closeDialogWindow() {
+  setTimeout(() => { getCurrentWebviewWindow().close(); }, 0);
+}
+
 // ── Shared state (used by both views) ──────────────────────────────────────
 interface CustomShortcut {
   id: string;
@@ -78,7 +85,7 @@ async function submitShortcut(mode: "add" | "edit") {
     } else {
       await invoke<CustomShortcut>("update_custom_shortcut", { id: editShortcutId, name, url, icon: newShortcutIcon.value ?? null });
     }
-    await getCurrentWebviewWindow().close();
+    closeDialogWindow();
   } catch (e) {
     addError.value = String(e);
   } finally {
@@ -314,7 +321,7 @@ async function addFromCatalog(entry: CatalogEntry) {
       icon: entry.icon,
     });
     await emit("messenger-added", m);
-    await getCurrentWebviewWindow().close();
+    closeDialogWindow();
   } catch (e) {
     addError.value = String(e);
   } finally {
@@ -540,7 +547,7 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportVie
     <div class="mt-auto flex justify-end">
       <button
         class="px-4 py-2 rounded-lg text-sm text-text-muted hover:bg-surface-hover cursor-pointer transition-colors"
-        @click="getCurrentWebviewWindow().close()"
+        @click="closeDialogWindow()"
       >Cancel</button>
     </div>
   </div>
@@ -581,7 +588,7 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportVie
     </div>
     <button
       class="text-[11px] text-text-muted hover:text-text-primary cursor-pointer text-center transition-colors"
-      @click="getCurrentWebviewWindow().close()"
+      @click="closeDialogWindow()"
     >Cancel</button>
   </div>
 
@@ -618,7 +625,7 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportVie
         style="color-scheme: dark;"
         autofocus
         @keydown.enter="submitShortcut(isEditDialogView ? 'edit' : 'add')"
-        @keydown.esc="getCurrentWebviewWindow().close()"
+        @keydown.esc="closeDialogWindow()"
       />
     </div>
 
@@ -631,7 +638,7 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportVie
         class="rounded-lg border border-glass-border bg-surface-hover px-3 py-2 text-sm text-text-primary outline-none focus:border-accent transition-colors"
         style="color-scheme: dark;"
         @keydown.enter="submitShortcut(isEditDialogView ? 'edit' : 'add')"
-        @keydown.esc="getCurrentWebviewWindow().close()"
+        @keydown.esc="closeDialogWindow()"
       />
     </div>
 
@@ -661,7 +668,7 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportVie
     <div class="mt-auto flex gap-2 justify-end">
       <button
         class="px-4 py-2 rounded-lg text-sm text-text-muted hover:bg-surface-hover cursor-pointer transition-colors"
-        @click="getCurrentWebviewWindow().close()"
+        @click="closeDialogWindow()"
       >Cancel</button>
       <button
         :class="isAdding ? 'bg-surface-active text-text-muted cursor-wait' : 'bg-accent text-surface hover:opacity-90'"
