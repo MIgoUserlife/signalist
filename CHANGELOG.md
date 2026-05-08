@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Виправлено
+- **WhatsApp більше не відкриває Chrome під час входу** — службова сторінка `flows.whatsapp.net/flows/cache_management/`, яку WhatsApp Web викликає при першій авторизації та cache-management операціях, раніше випадала з whitelist (`static.whatsapp.net`) і потрапляла до nav_guard як «зовнішнє посилання» — Signalist відкривав її в Google Chrome. Whitelist розширено до всього `whatsapp.net`, що покриває всі службові субдомени WhatsApp (flows, static, mmg тощо)
+
 ---
 
 ## [0.4.2] — 2026-05-06

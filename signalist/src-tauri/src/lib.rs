@@ -55,7 +55,7 @@ const MESSENGERS: &[Messenger] = &[
         label: "whatsapp",
         display_name: "WhatsApp",
         url: "https://web.whatsapp.com/",
-        allowed_domains: &["web.whatsapp.com", "whatsapp.com", "static.whatsapp.net"],
+        allowed_domains: &["web.whatsapp.com", "whatsapp.com", "whatsapp.net"],
         data_store_id: [
             0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x02,
