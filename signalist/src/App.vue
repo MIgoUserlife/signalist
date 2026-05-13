@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, computed, watch, onMounted, onUnmounted } from "vue";
+import { ref, reactive, computed, watch, onMounted, onUnmounted, type Ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -249,25 +249,18 @@ async function installUpdate() {
   }
 }
 
-async function toggleAutostart() {
-  const next = !autostartEnabled.value;
+async function toggleBoolSetting(command: string, state: Ref<boolean>, label: string) {
+  const next = !state.value;
   try {
-    await invoke("set_autostart", { enable: next });
-    autostartEnabled.value = next;
+    await invoke(command, { enable: next });
+    state.value = next;
   } catch (e) {
-    console.error("Failed to toggle autostart:", e);
+    console.error(`Failed to toggle ${label}:`, e);
   }
 }
 
-async function toggleSilence() {
-  const next = !silenceEnabled.value;
-  try {
-    await invoke("set_silence_mode", { enable: next });
-    silenceEnabled.value = next;
-  } catch (e) {
-    console.error("Failed to toggle silence mode:", e);
-  }
-}
+const toggleAutostart = () => toggleBoolSetting("set_autostart", autostartEnabled, "autostart");
+const toggleSilence   = () => toggleBoolSetting("set_silence_mode", silenceEnabled, "silence mode");
 
 async function saveHotkey(shortcut: string) {
   isRecordingHotkey.value = false;
@@ -477,8 +470,10 @@ onMounted(async () => {
   );
 
   try {
-    const unlistenAction = await onAction(() => invoke("show_window"));
-    unlisteners.push(unlistenAction.unregister.bind(unlistenAction));
+    const unlistenAction = await onAction(() => {
+      invoke("show_window").catch(e => console.warn("show_window failed:", e));
+    });
+    unlisteners.push(() => unlistenAction.unregister());
   } catch (e) {
     console.warn("Failed to register notification action listener:", e);
   }

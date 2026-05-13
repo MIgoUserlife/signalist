@@ -416,18 +416,6 @@ fn fire_notification_if_stable(app: &AppHandle, messenger: &str) {
         .map(|c| c.display_name.to_string())
         .unwrap_or_else(|| messenger.to_string());
 
-    {
-        let Some(tracker) = app.try_state::<NotifyTracker>() else { return };
-        let mut map = tracker.0.lock().unwrap();
-        let entry = map.entry(messenger.to_string()).or_default();
-        if current_count <= entry.last_notified {
-            return;
-        }
-        entry.last_notified = current_count;
-    }
-
-    // Baseline is now updated. If the user is looking at the app, or silence
-    // mode is on, suppress the OS notification.
     if app.try_state::<SilenceMode>().map(|s| *s.0.lock().unwrap()).unwrap_or(false) {
         return;
     }
@@ -437,6 +425,16 @@ fn fire_notification_if_stable(app: &AppHandle, messenger: &str) {
         .unwrap_or(false);
     if window_focused {
         return;
+    }
+
+    {
+        let Some(tracker) = app.try_state::<NotifyTracker>() else { return };
+        let mut map = tracker.0.lock().unwrap();
+        let entry = map.entry(messenger.to_string()).or_default();
+        if current_count <= entry.last_notified {
+            return;
+        }
+        entry.last_notified = current_count;
     }
 
     let body = if current_count == 1 {
@@ -930,8 +928,7 @@ fn hide_all_messengers(app: &AppHandle) {
     }
 }
 
-#[tauri::command]
-fn show_window(app: AppHandle) {
+fn do_show_window(app: &AppHandle) {
     let Some(window) = app.get_window("main") else { return };
     let _ = window.show();
     let _ = window.set_focus();
@@ -942,6 +939,11 @@ fn show_window(app: AppHandle) {
             let _ = webview.set_focus();
         }
     }
+}
+
+#[tauri::command]
+fn show_window(app: AppHandle) {
+    do_show_window(&app);
 }
 
 fn toggle_window(app: &AppHandle) {
@@ -959,15 +961,7 @@ fn toggle_window(app: &AppHandle) {
     } else if visible {
         let _ = window.set_focus();
     } else {
-        let _ = window.show();
-        let _ = window.set_focus();
-        let active = app.state::<ActiveMessenger>().0.lock().unwrap().clone();
-        if !active.is_empty() {
-            if let Some(webview) = app.get_webview(&active) {
-                let _ = webview.show();
-                let _ = webview.set_focus();
-            }
-        }
+        do_show_window(app);
     }
 }
 
@@ -998,9 +992,13 @@ fn get_silence_mode(state: State<SilenceMode>) -> bool {
 
 #[tauri::command]
 fn set_silence_mode(app: AppHandle, state: State<SilenceMode>, enable: bool) -> Result<(), String> {
-    *state.0.lock().unwrap() = enable;
+    {
+        let mut v = state.0.lock().unwrap();
+        if *v == enable { return Ok(()); }
+        *v = enable;
+    }
     let store = app.store("settings.json").map_err(|e| e.to_string())?;
-    store.set("silence_mode", serde_json::Value::Bool(enable));
+    store.set("silence_mode", enable);
     store.save().map_err(|e| e.to_string())?;
     Ok(())
 }
