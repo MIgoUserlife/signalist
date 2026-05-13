@@ -91,6 +91,8 @@ pub struct HotkeyConfig(pub Mutex<String>);
 
 pub struct DockHidden(pub Mutex<bool>);
 
+pub struct SilenceMode(pub Mutex<bool>);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomShortcut {
     pub id: String,
@@ -424,8 +426,11 @@ fn fire_notification_if_stable(app: &AppHandle, messenger: &str) {
         entry.last_notified = current_count;
     }
 
-    // Baseline is now updated. If the user is looking at the app, suppress the
-    // OS notification — they can already see the count in the sidebar.
+    // Baseline is now updated. If the user is looking at the app, or silence
+    // mode is on, suppress the OS notification.
+    if app.try_state::<SilenceMode>().map(|s| *s.0.lock().unwrap()).unwrap_or(false) {
+        return;
+    }
     let window_focused = app
         .get_window("main")
         .and_then(|w| w.is_focused().ok())
@@ -973,6 +978,20 @@ fn set_autostart(app: AppHandle, enable: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_silence_mode(state: State<SilenceMode>) -> bool {
+    *state.0.lock().unwrap()
+}
+
+#[tauri::command]
+fn set_silence_mode(app: AppHandle, state: State<SilenceMode>, enable: bool) -> Result<(), String> {
+    *state.0.lock().unwrap() = enable;
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    store.set("silence_mode", serde_json::Value::Bool(enable));
+    store.save().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 fn get_global_shortcut(state: State<HotkeyConfig>) -> String {
     state.0.lock().unwrap().clone()
 }
@@ -1054,6 +1073,7 @@ pub fn run() {
         .manage(NotifyTracker::default())
         .manage(HotkeyConfig(Mutex::new(String::new())))
         .manage(DockHidden(Mutex::new(false)))
+        .manage(SilenceMode(Mutex::new(false)))
         .manage(CustomShortcuts(Mutex::new(Vec::new())))
         .manage(UserMessengers(Mutex::new(Vec::new())))
         .invoke_handler(tauri::generate_handler![
@@ -1063,6 +1083,8 @@ pub fn run() {
             get_active_messenger,
             update_sidebar_theme_from_webview,
             update_unread_count,
+            get_silence_mode,
+            set_silence_mode,
             get_global_shortcut,
             set_global_shortcut,
             get_autostart,
@@ -1139,6 +1161,9 @@ pub fn run() {
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default();
             *app.state::<CustomShortcuts>().0.lock().unwrap() = saved_shortcuts;
+
+            let saved_silence = store.get("silence_mode").and_then(|v| v.as_bool()).unwrap_or(false);
+            *app.state::<SilenceMode>().0.lock().unwrap() = saved_silence;
 
             let saved_user_messengers: Vec<UserMessenger> = store
                 .get("user_messengers")

@@ -116,6 +116,7 @@ const isRecordingHotkey = ref(false);
 const hotkeyError = ref("");
 
 const autostartEnabled = ref(false);
+const silenceEnabled = ref(false);
 const settingsOpen = ref(false);
 const settingsWrapper = ref<HTMLElement | null>(null);
 
@@ -255,6 +256,16 @@ async function toggleAutostart() {
     autostartEnabled.value = next;
   } catch (e) {
     console.error("Failed to toggle autostart:", e);
+  }
+}
+
+async function toggleSilence() {
+  const next = !silenceEnabled.value;
+  try {
+    await invoke("set_silence_mode", { enable: next });
+    silenceEnabled.value = next;
+  } catch (e) {
+    console.error("Failed to toggle silence mode:", e);
   }
 }
 
@@ -433,6 +444,12 @@ onMounted(async () => {
     autostartEnabled.value = await invoke<boolean>("get_autostart");
   } catch (e) {
     console.warn("Failed to load autostart state:", e);
+  }
+
+  try {
+    silenceEnabled.value = await invoke<boolean>("get_silence_mode");
+  } catch (e) {
+    console.warn("Failed to load silence mode:", e);
   }
 
   unlisteners.push(
@@ -834,6 +851,29 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportVie
                 </svg>
                 <span class="text-[9px] leading-none opacity-70 select-none font-medium">
                   {{ autostartEnabled ? 'AUTO' : 'auto' }}
+                </span>
+              </button>
+
+              <!-- Silence mode button -->
+              <button
+                class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"
+                :class="silenceEnabled ? 'text-accent hover:bg-surface-hover' : 'text-text-muted hover:bg-surface-hover hover:text-text-primary'"
+                :title="silenceEnabled ? 'Тиша увімкнена — сповіщення вимкнено. Натисніть, щоб увімкнути' : 'Сповіщення увімкнено — натисніть, щоб вимкнути'"
+                @click="toggleSilence"
+              >
+                <svg v-if="silenceEnabled" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V5a3 3 0 0 0-5.94-.6"/>
+                  <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/>
+                  <line x1="12" y1="19" x2="12" y2="22"/>
+                  <line x1="2" y1="2" x2="22" y2="22"/>
+                </svg>
+                <svg v-else xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                  <line x1="12" y1="19" x2="12" y2="22"/>
+                </svg>
+                <span class="text-[9px] leading-none opacity-70 select-none font-medium">
+                  {{ silenceEnabled ? 'MUTE' : 'mute' }}
                 </span>
               </button>
 
