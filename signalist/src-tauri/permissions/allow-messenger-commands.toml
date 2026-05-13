@@ -27,4 +27,5 @@ commands.allow = [
   "log_js_error",
   "open_bug_report_window",
   "open_in_browser",
+  "show_window",
 ]

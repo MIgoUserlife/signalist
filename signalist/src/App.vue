@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
+import { isPermissionGranted, requestPermission, onAction } from "@tauri-apps/plugin-notification";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import logoIcon from './assets/logo.svg?raw';
@@ -475,6 +475,13 @@ onMounted(async () => {
       autoIsDark.value = event.payload;
     }),
   );
+
+  try {
+    const unlistenAction = await onAction(() => invoke("show_window"));
+    unlisteners.push(unlistenAction.unregister.bind(unlistenAction));
+  } catch (e) {
+    console.warn("Failed to register notification action listener:", e);
+  }
 
   const mq = window.matchMedia('(prefers-color-scheme: dark)');
   const mqHandler = (e: MediaQueryListEvent) => { systemIsDark.value = e.matches; };

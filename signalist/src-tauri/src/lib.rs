@@ -930,6 +930,20 @@ fn hide_all_messengers(app: &AppHandle) {
     }
 }
 
+#[tauri::command]
+fn show_window(app: AppHandle) {
+    let Some(window) = app.get_window("main") else { return };
+    let _ = window.show();
+    let _ = window.set_focus();
+    let active = app.state::<ActiveMessenger>().0.lock().unwrap().clone();
+    if !active.is_empty() {
+        if let Some(webview) = app.get_webview(&active) {
+            let _ = webview.show();
+            let _ = webview.set_focus();
+        }
+    }
+}
+
 fn toggle_window(app: &AppHandle) {
     let Some(window) = app.get_window("main") else { return };
     if window.is_fullscreen().unwrap_or(false) {
@@ -1105,6 +1119,7 @@ pub fn run() {
             log_js_error,
             open_bug_report_window,
             open_in_browser,
+            show_window,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
