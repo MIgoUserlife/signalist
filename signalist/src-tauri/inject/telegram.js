@@ -26,28 +26,65 @@
     return null;
   }
 
+  // Hosts that belong to Telegram itself — navigation to these stays inside the webview.
+  const INTERNAL_HOST_RE = /(^|\.)(telegram\.org|t\.me)$/i;
+
+  function isExternalUrl(parsed) {
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    if (INTERNAL_HOST_RE.test(parsed.hostname)) return false;
+    return parsed.origin !== location.origin;
+  }
+
+  function sendOpenInBrowser(url) {
+    (function tryInvoke() {
+      const invoke = resolveInvoke();
+      if (invoke) {
+        invoke('open_in_browser', { url: url }).catch(() => {});
+      } else {
+        setTimeout(tryInvoke, 100);
+      }
+    })();
+  }
+
   (function patchWindowOpen() {
     const _open = window.open.bind(window);
     window.open = function (url, target, features) {
       if (typeof url === 'string' && /^https?:\/\//i.test(url)) {
         try {
           const parsed = new URL(url);
-          if (parsed.origin !== location.origin) {
-            function tryInvoke() {
-              const invoke = resolveInvoke();
-              if (invoke) {
-                invoke('open_in_browser', { url: url }).catch(() => {});
-              } else {
-                setTimeout(tryInvoke, 100);
-              }
-            }
-            tryInvoke();
+          if (isExternalUrl(parsed)) {
+            sendOpenInBrowser(url);
             return null;
           }
         } catch (_) {}
       }
       return _open(url, target, features);
     };
+  })();
+
+  // WKWebView does not open `<a target="_blank">` links (no `window.open` call,
+  // no in-frame navigation to hit on_navigation), so external links silently do
+  // nothing. Intercept clicks on anchors and hand external URLs to the OS browser.
+  (function patchLinkClicks() {
+    document.addEventListener(
+      'click',
+      function (e) {
+        if (e.defaultPrevented || e.button !== 0) return;
+        const anchor = e.target && e.target.closest && e.target.closest('a[href]');
+        if (!anchor) return;
+        let parsed;
+        try {
+          parsed = new URL(anchor.href, location.href);
+        } catch (_) {
+          return;
+        }
+        if (!isExternalUrl(parsed)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        sendOpenInBrowser(parsed.href);
+      },
+      true,
+    );
   })();
 
   function tryFlush() {
