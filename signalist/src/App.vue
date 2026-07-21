@@ -27,6 +27,10 @@ const isAddMessengerView = _view === "add-messenger";
 const isBugReportView = _view === "bug-report";
 const editShortcutId = _params.get("id") ?? "";
 
+// True only when running via `npm run tauri:dev` (Vite dev server); false in
+// production builds. Drives the DEV badge that flags this as the dev instance.
+const isDev = import.meta.env.DEV;
+
 if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportView) {
   document.documentElement.classList.add('sidebar-view');
 }
@@ -710,6 +714,9 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportVie
         <span class="flex h-10 w-10 items-center justify-center text-accent [&>svg]:h-10 [&>svg]:w-10" v-html="logoIcon" />
         <span v-if="appVersion" class="mt-1 text-[9px] leading-none text-text-muted select-none opacity-50">
           v{{ appVersion }}
+        </span>
+        <span v-if="isDev" class="mt-2 rounded px-1 py-[5px] text-[8px] font-bold leading-none tracking-wider text-white bg-red-500 select-none">
+          DEV
         </span>
       </div>
 

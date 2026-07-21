@@ -100,7 +100,7 @@ npm run build
 cd src-tauri && cargo check
 ```
 
-> **Примітка щодо dev-режиму.** DevTools для месенджер-webview доступні лише в debug-збірці (`npm run tauri dev`). У production вони вимкнені. Логи Rust виводяться у термінал лише при `#[cfg(debug_assertions)]`.
+> **Примітка щодо dev-режиму.** DevTools для месенджер-webview доступні лише в debug-збірці (`npm run tauri dev`). У production вони вимкнені. Логи Rust виводяться у термінал лише при `#[cfg(debug_assertions)]`. У сайдбарі під версією показується червоний бейдж **DEV** (керується `import.meta.env.DEV`), щоб dev-інстанс візуально не сплутати з release-збіркою — у production бейдж не рендериться.
 
 ---
 
