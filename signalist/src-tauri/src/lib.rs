@@ -558,6 +558,10 @@ async fn open_messenger(app: AppHandle, messenger: String) -> Result<String, Str
         .data_store_identifier(config.data_store_id)
         .on_navigation(nav_guard)
         .devtools(cfg!(debug_assertions))
+        // Let the web app receive native HTML5 file drops (e.g. dragging a
+        // screenshot into a chat). Tauri's own drag-drop handler otherwise
+        // swallows the OS drop before it reaches the messenger's page.
+        .disable_drag_drop_handler()
         .initialization_script(init_script);
 
     hide_all_messengers(&app);
@@ -878,6 +882,8 @@ async fn open_custom_shortcut(
         .data_store_identifier(data_store_id)
         .on_navigation(nav_guard)
         .devtools(cfg!(debug_assertions))
+        // Same as messengers: allow native HTML5 file drops into the web app.
+        .disable_drag_drop_handler()
         .initialization_script(inject);
 
     hide_all_messengers(&app);
