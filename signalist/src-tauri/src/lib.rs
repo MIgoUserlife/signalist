@@ -100,6 +100,9 @@ pub struct CustomShortcut {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// Tint applied to the sidebar icon, as `#rrggbb`. `None` follows the theme accent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
 }
 
 impl CustomShortcut {
@@ -114,6 +117,25 @@ fn custom_webview_label(id: &str) -> String {
 
 fn is_custom_label(label: &str) -> bool {
     label.starts_with("custom-")
+}
+
+/// Accepts only `#rrggbb`; the value is bound straight into a CSS `color`
+/// property in the sidebar, so anything else is rejected rather than sanitized.
+/// Empty/blank input means "no custom color".
+fn normalize_color(color: Option<String>) -> Result<Option<String>, String> {
+    let Some(raw) = color else { return Ok(None) };
+    let value = raw.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let is_hex6 = value.len() == 7
+        && value.starts_with('#')
+        && value[1..].chars().all(|c| c.is_ascii_hexdigit());
+    if is_hex6 {
+        Ok(Some(value))
+    } else {
+        Err(format!("Invalid color: {} (expected #rrggbb)", raw))
+    }
 }
 
 fn content_bounds(window_logical: LogicalSize<f64>) -> (LogicalPosition<f64>, LogicalSize<f64>) {
@@ -641,8 +663,8 @@ async fn open_add_shortcut_window(app: AppHandle) -> Result<(), String> {
         WebviewUrl::App("index.html?view=add-shortcut".into()),
     )
     .title("Add Web Shortcut")
-    .inner_size(360.0, 480.0)
-    .min_inner_size(360.0, 480.0)
+    .inner_size(360.0, 560.0)
+    .min_inner_size(360.0, 560.0)
     .resizable(false)
     .center()
     .build()
@@ -663,8 +685,8 @@ async fn open_edit_shortcut_window(app: AppHandle, id: String) -> Result<(), Str
         WebviewUrl::App(url.into()),
     )
     .title("Edit Web Shortcut")
-    .inner_size(360.0, 400.0)
-    .min_inner_size(360.0, 400.0)
+    .inner_size(360.0, 490.0)
+    .min_inner_size(360.0, 490.0)
     .resizable(false)
     .center()
     .build()
@@ -679,12 +701,14 @@ fn update_custom_shortcut(
     name: String,
     url: String,
     icon: Option<String>,
+    color: Option<String>,
 ) -> Result<CustomShortcut, String> {
     let parsed: tauri::Url = url.parse().map_err(|e| format!("Invalid URL: {}", e))?;
     let host = parsed.host_str().ok_or("URL has no host")?;
     if is_google_domain(host) {
         return Err("Google services (Gemini, Google, YouTube) are not supported in the embedded window due to Google's policy".into());
     }
+    let color = normalize_color(color)?;
 
     let label = custom_webview_label(&id);
     let (updated, url_changed) = {
@@ -696,6 +720,7 @@ fn update_custom_shortcut(
         sc.name = name;
         sc.url = url;
         sc.icon = icon;
+        sc.color = color;
         (sc.clone(), url_changed)
     };
 
@@ -717,18 +742,50 @@ fn list_custom_shortcuts(app: AppHandle) -> Result<Vec<CustomShortcut>, String> 
 }
 
 #[tauri::command]
-fn add_custom_shortcut(app: AppHandle, name: String, url: String, icon: Option<String>) -> Result<CustomShortcut, String> {
+fn add_custom_shortcut(app: AppHandle, name: String, url: String, icon: Option<String>, color: Option<String>) -> Result<CustomShortcut, String> {
     let parsed: tauri::Url = url.parse().map_err(|e| format!("Invalid URL: {}", e))?;
     let host = parsed.host_str().ok_or("URL has no host")?;
     if is_google_domain(host) {
         return Err("Google services (Gemini, Google, YouTube) are not supported in the embedded window due to Google's policy".into());
     }
-    let sc = CustomShortcut { id: generate_shortcut_id(), name, url, icon };
+    let color = normalize_color(color)?;
+    let sc = CustomShortcut { id: generate_shortcut_id(), name, url, icon, color };
     app.state::<CustomShortcuts>().0.lock().unwrap().push(sc.clone());
     persist_custom_shortcuts(&app)?;
     update_tray(&app);
     let _ = app.emit("shortcut-added", sc.clone());
     Ok(sc)
+}
+
+/// Reorders shortcuts to match `ids`. Order is purely presentational (sidebar
+/// and tray menu both render the vec as-is), so nothing but persistence and the
+/// tray needs refreshing — webviews keep their labels and data stores.
+#[tauri::command]
+fn reorder_custom_shortcuts(app: AppHandle, ids: Vec<String>) -> Result<Vec<CustomShortcut>, String> {
+    let reordered = {
+        let state = app.state::<CustomShortcuts>();
+        let mut shortcuts = state.0.lock().unwrap();
+        if ids.len() != shortcuts.len() {
+            return Err(format!("Expected {} ids, got {}", shortcuts.len(), ids.len()));
+        }
+        // Only an exact permutation is accepted: a missing or duplicated id would
+        // silently drop a shortcut and orphan its webview + data store.
+        let mut remaining = shortcuts.clone();
+        let mut picked = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let pos = remaining
+                .iter()
+                .position(|sc| &sc.id == id)
+                .ok_or_else(|| format!("Unknown or duplicated shortcut id: {}", id))?;
+            picked.push(remaining.remove(pos));
+        }
+        *shortcuts = picked.clone();
+        picked
+    };
+
+    persist_custom_shortcuts(&app)?;
+    update_tray(&app);
+    Ok(reordered)
 }
 
 #[tauri::command]
@@ -1114,6 +1171,7 @@ pub fn run() {
             add_custom_shortcut,
             update_custom_shortcut,
             remove_custom_shortcut,
+            reorder_custom_shortcuts,
             open_custom_shortcut,
             list_user_messengers,
             add_user_messenger,

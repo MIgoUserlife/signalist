@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, computed, watch, onMounted, onUnmounted, type Ref } from "vue";
+import { ref, reactive, computed, watch, onMounted, onUnmounted, type Ref, type CSSProperties } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -48,6 +48,7 @@ interface CustomShortcut {
   name: string;
   url: string;
   icon?: string;
+  color?: string;
 }
 
 interface UserMessenger {
@@ -62,6 +63,21 @@ const newShortcutUrl = ref("");
 const addError = ref("");
 const isAdding = ref(false);
 const newShortcutIcon = ref<string | null>(null);
+const newShortcutColor = ref<string | null>(null);
+
+// Mid-tone hues, picked to stay legible on both the dark (#1e1b18) and the
+// light (#f2efe8) surface. Every icon SVG paints with currentColor, so tinting
+// the button is enough. `null` means "follow the theme accent".
+const SHORTCUT_COLORS = [
+  { name: 'Red',    value: '#e05561' },
+  { name: 'Orange', value: '#e08c3c' },
+  { name: 'Yellow', value: '#d4a72c' },
+  { name: 'Green',  value: '#4caf50' },
+  { name: 'Teal',   value: '#2bb3a3' },
+  { name: 'Blue',   value: '#4a9eff' },
+  { name: 'Purple', value: '#a06cd5' },
+  { name: 'Pink',   value: '#e0669e' },
+] as const;
 
 const QUICK_PRESETS = [
   { name: 'Claude',        url: 'https://claude.ai/new',    icon: 'claude'      },
@@ -84,10 +100,11 @@ async function submitShortcut(mode: "add" | "edit") {
   if (!/^https?:\/\//i.test(url)) url = "https://" + url;
   isAdding.value = true;
   try {
+    const color = newShortcutColor.value ?? null;
     if (mode === "add") {
-      await invoke<CustomShortcut>("add_custom_shortcut", { name, url, icon: newShortcutIcon.value ?? null });
+      await invoke<CustomShortcut>("add_custom_shortcut", { name, url, icon: newShortcutIcon.value ?? null, color });
     } else {
-      await invoke<CustomShortcut>("update_custom_shortcut", { id: editShortcutId, name, url, icon: newShortcutIcon.value ?? null });
+      await invoke<CustomShortcut>("update_custom_shortcut", { id: editShortcutId, name, url, icon: newShortcutIcon.value ?? null, color });
     }
     closeDialogWindow();
   } catch (e) {
@@ -351,6 +368,92 @@ async function switchToCustom(sc: CustomShortcut) {
   }
 }
 
+// ── Drag-to-reorder (custom shortcuts zone only) ────────────────────────────
+// Pointer events, not the HTML5 drag-and-drop API: the sidebar webview keeps
+// Tauri's OS-level drag-drop handler enabled, and that handler swallows `drop`
+// before it reaches the page — the same cause as the messenger file-drop fix.
+const SHORTCUT_STEP = 44; // h-10 button (40px) + gap-1 (4px)
+const DRAG_THRESHOLD = 4; // dead zone so a sloppy click still opens the shortcut
+
+const dragIndex = ref<number | null>(null);
+const dragTargetIndex = ref<number | null>(null);
+const dragOffset = ref(0);
+let dragStartY = 0;
+let dragMoved = false;
+let suppressClick = false;
+
+function onShortcutPointerDown(e: PointerEvent, index: number) {
+  suppressClick = false;
+  if (e.button !== 0 || customShortcuts.value.length < 2) return;
+  dragStartY = e.clientY;
+  dragMoved = false;
+  dragIndex.value = index;
+  dragTargetIndex.value = index;
+  dragOffset.value = 0;
+  (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+}
+
+function onShortcutPointerMove(e: PointerEvent) {
+  if (dragIndex.value === null) return;
+  const dy = e.clientY - dragStartY;
+  if (!dragMoved && Math.abs(dy) < DRAG_THRESHOLD) return;
+  dragMoved = true;
+  dragOffset.value = dy;
+  const last = customShortcuts.value.length - 1;
+  const target = dragIndex.value + Math.round(dy / SHORTCUT_STEP);
+  dragTargetIndex.value = Math.min(last, Math.max(0, target));
+}
+
+async function onShortcutPointerUp(e: PointerEvent) {
+  const from = dragIndex.value;
+  const to = dragTargetIndex.value;
+  const el = e.currentTarget as HTMLElement;
+  if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+
+  // Cleared before the await so the transition classes drop in the same render
+  // as the transforms — otherwise the settled items animate from a stale offset.
+  dragIndex.value = null;
+  dragTargetIndex.value = null;
+  dragOffset.value = 0;
+  if (!dragMoved) return;
+  dragMoved = false;
+  suppressClick = true; // the click that follows this pointerup is not a real click
+
+  if (from === null || to === null || from === to) return;
+  const previous = customShortcuts.value;
+  const list = [...previous];
+  const [moved] = list.splice(from, 1);
+  list.splice(to, 0, moved);
+  customShortcuts.value = list;
+  try {
+    await invoke("reorder_custom_shortcuts", { ids: list.map(sc => sc.id) });
+  } catch (err) {
+    console.error("Failed to reorder shortcuts:", err);
+    customShortcuts.value = previous;
+  }
+}
+
+function shortcutDragStyle(index: number): CSSProperties | undefined {
+  const from = dragIndex.value;
+  const to = dragTargetIndex.value;
+  if (from === null || to === null) return undefined;
+  if (index === from) {
+    return { transform: `translateY(${dragOffset.value}px) scale(1.08)`, transition: "none" };
+  }
+  // Items between the grabbed slot and the drop slot slide one step to open the gap
+  if (from < to && index > from && index <= to) return { transform: `translateY(${-SHORTCUT_STEP}px)` };
+  if (from > to && index < from && index >= to) return { transform: `translateY(${SHORTCUT_STEP}px)` };
+  return undefined;
+}
+
+function onShortcutClick(sc: CustomShortcut) {
+  if (suppressClick) {
+    suppressClick = false;
+    return;
+  }
+  switchToCustom(sc);
+}
+
 async function removeShortcut(id: string) {
   await invoke("remove_custom_shortcut", { id });
   customShortcuts.value = customShortcuts.value.filter(sc => sc.id !== id);
@@ -407,6 +510,7 @@ onMounted(async () => {
         newShortcutName.value = sc.name;
         newShortcutUrl.value = sc.url;
         newShortcutIcon.value = sc.icon ?? null;
+        newShortcutColor.value = sc.color ?? null;
       }
     } catch (e) {
       console.warn("Failed to load shortcut for editing:", e);
@@ -686,6 +790,53 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportVie
       </div>
     </div>
 
+    <div class="flex flex-col gap-1">
+      <label class="text-text-muted text-xs">Color <span class="opacity-50">(optional)</span></label>
+      <div class="flex items-center gap-2">
+        <!-- Live preview of the sidebar button -->
+        <span
+          class="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-glass-border text-sm font-semibold"
+          :class="newShortcutColor ? '' : 'text-accent'"
+          :style="newShortcutColor ? { color: newShortcutColor } : undefined"
+        >
+          <span
+            v-if="newShortcutIcon && iconMap[newShortcutIcon]"
+            class="flex h-4.5 w-4.5 [&>svg]:h-4.5 [&>svg]:w-4.5"
+            v-html="iconMap[newShortcutIcon]"
+          />
+          <template v-else>{{ shortcutInitial(newShortcutName) }}</template>
+        </span>
+
+        <div class="flex flex-wrap items-center gap-1">
+          <button
+            type="button"
+            :class="[
+              'h-5 w-5 rounded-full bg-transparent cursor-pointer transition-all duration-100',
+              newShortcutColor === null
+                ? 'border-2 border-text-primary'
+                : 'border border-dashed border-glass-border hover:border-text-muted',
+            ]"
+            title="Default (theme accent)"
+            @click="newShortcutColor = null"
+          />
+          <button
+            v-for="c in SHORTCUT_COLORS"
+            :key="c.value"
+            type="button"
+            :class="[
+              'h-5 w-5 rounded-full cursor-pointer transition-all duration-100',
+              newShortcutColor === c.value
+                ? 'border-2 border-text-primary'
+                : 'border border-glass-border hover:scale-110',
+            ]"
+            :style="{ backgroundColor: c.value }"
+            :title="c.name"
+            @click="newShortcutColor = newShortcutColor === c.value ? null : c.value"
+          />
+        </div>
+      </div>
+    </div>
+
     <p v-if="addError" class="text-[11px] text-red-400 -mt-2">{{ addError }}</p>
 
     <div class="mt-auto flex gap-2 justify-end">
@@ -791,19 +942,29 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportVie
       <!-- Zone 3: Custom Shortcuts + Add button -->
       <div class="flex w-full flex-col items-center gap-1 px-2 pt-3">
         <div
-          v-for="sc in customShortcuts"
+          v-for="(sc, i) in customShortcuts"
           :key="sc.id"
           class="relative group"
+          :class="[
+            dragIndex === i ? 'z-10' : '',
+            dragIndex !== null ? 'transition-transform duration-150' : '',
+          ]"
+          :style="shortcutDragStyle(i)"
         >
           <button
             :class="[
-              'flex h-10 w-10 items-center justify-center rounded-xl text-sm font-semibold cursor-pointer transition-all duration-150',
+              'flex h-10 w-10 items-center justify-center rounded-xl text-sm font-semibold cursor-pointer touch-none transition-all duration-150',
               activeMessenger === shortcutLabel(sc.id)
                 ? 'bg-glass-border text-accent'
                 : 'text-text-muted hover:bg-surface-hover',
             ]"
+            :style="sc.color ? { color: sc.color } : undefined"
             :title="sc.name"
-            @click="switchToCustom(sc)"
+            @pointerdown="onShortcutPointerDown($event, i)"
+            @pointermove="onShortcutPointerMove"
+            @pointerup="onShortcutPointerUp"
+            @pointercancel="onShortcutPointerUp"
+            @click="onShortcutClick(sc)"
             @contextmenu.prevent="invoke('open_edit_shortcut_window', { id: sc.id })"
           >
             <span v-if="sc.icon && iconMap[sc.icon]" class="flex h-5 w-5 [&>svg]:h-5 [&>svg]:w-5" v-html="iconMap[sc.icon]" />
