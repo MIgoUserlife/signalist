@@ -9,6 +9,7 @@ use tauri::{
     webview::WebviewBuilder, AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, State,
     RunEvent, WebviewUrl, WebviewWindowBuilder, WindowBuilder, WindowEvent,
 };
+use tauri::utils::config::BackgroundThrottlingPolicy;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_store::StoreExt;
@@ -154,6 +155,10 @@ pub struct UserMessenger {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// Create this webview at app startup instead of on first click. Costs one
+    /// background WebContent process; see `preload_at_startup`.
+    #[serde(default)]
+    pub preload: bool,
 }
 
 impl UserMessenger {
@@ -163,6 +168,26 @@ impl UserMessenger {
 }
 
 pub struct UserMessengers(pub Mutex<Vec<UserMessenger>>);
+
+/// Per-label preload flag for the built-in messengers. Absent label means the
+/// default (`true`) — a fresh install loads Telegram and WhatsApp at startup so
+/// their inject scripts report unread counts without being opened first.
+#[derive(Default)]
+pub struct BuiltinPreload(pub Mutex<HashMap<String, bool>>);
+
+fn builtin_preload_enabled(app: &AppHandle, label: &str) -> bool {
+    app.try_state::<BuiltinPreload>()
+        .and_then(|s| s.0.lock().unwrap().get(label).copied())
+        .unwrap_or(true)
+}
+
+fn persist_builtin_preload(app: &AppHandle) -> Result<(), String> {
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    let flags = app.state::<BuiltinPreload>().0.lock().unwrap().clone();
+    let json = serde_json::to_value(&flags).map_err(|e| e.to_string())?;
+    store.set("builtin_preload", json);
+    store.save().map_err(|e| e.to_string())
+}
 
 fn is_google_domain(domain: &str) -> bool {
     let d = domain.trim_start_matches("www.").to_ascii_lowercase();
@@ -527,12 +552,27 @@ fn reposition_webviews(app: &AppHandle) {
 
 #[tauri::command]
 async fn open_messenger(app: AppHandle, messenger: String) -> Result<String, String> {
+    ensure_messenger_webview(app, messenger, true).await
+}
+
+/// Creates the messenger webview if missing, then either brings it to the front
+/// (`activate`) or leaves it hidden in the background. The hidden path is what
+/// startup preloading uses: the page loads and its inject script starts
+/// reporting unread counts without ever becoming the visible view.
+async fn ensure_messenger_webview(
+    app: AppHandle,
+    messenger: String,
+    activate: bool,
+) -> Result<String, String> {
     let config = MESSENGERS
         .iter()
         .find(|m| m.label == messenger)
         .ok_or_else(|| format!("Unknown messenger: {}", messenger))?;
 
     if let Some(webview) = app.get_webview(config.label) {
+        if !activate {
+            return Ok(format!("{} already loaded", config.label));
+        }
         hide_all_messengers(&app);
         webview.show().map_err(|e| e.to_string())?;
         webview.set_focus().map_err(|e| e.to_string())?;
@@ -580,21 +620,39 @@ async fn open_messenger(app: AppHandle, messenger: String) -> Result<String, Str
         .data_store_identifier(config.data_store_id)
         .on_navigation(nav_guard)
         .devtools(cfg!(debug_assertions))
+        // Without this, WebKit throttles timers of a hidden view and fully
+        // suspends it after ~5 minutes — the inject script would stop reporting
+        // unread counts, which is exactly what background tracking needs.
+        // macOS 14+; a no-op on older versions.
+        .background_throttling(BackgroundThrottlingPolicy::Disabled)
         // Let the web app receive native HTML5 file drops (e.g. dragging a
         // screenshot into a chat). Tauri's own drag-drop handler otherwise
         // swallows the OS drop before it reaches the messenger's page.
         .disable_drag_drop_handler()
         .initialization_script(init_script);
 
-    hide_all_messengers(&app);
+    // A preloaded view must not steal focus from whatever is on screen.
+    let webview_builder = if activate { webview_builder } else { webview_builder.focused(false) };
 
-    window
+    if activate {
+        hide_all_messengers(&app);
+    }
+
+    let child = window
         .add_child(
             webview_builder,
             LogicalPosition::new(SIDEBAR_WIDTH, 0.0),
             LogicalSize::new(content_width, content_height),
         )
         .map_err(|e| e.to_string())?;
+
+    if !activate {
+        // Built-in messengers keep their full size while hidden so the inject
+        // script keeps tracking unread counts (same reasoning as
+        // hide_all_messengers); only visibility is dropped.
+        let _ = child.hide();
+        return Ok(format!("Preloaded {}", config.label));
+    }
 
     let state = app.state::<ActiveMessenger>();
     let mut active = state.0.lock().unwrap();
@@ -666,6 +724,7 @@ async fn open_add_shortcut_window(app: AppHandle) -> Result<(), String> {
     .inner_size(360.0, 560.0)
     .min_inner_size(360.0, 560.0)
     .resizable(false)
+    .devtools(cfg!(debug_assertions))
     .center()
     .build()
     .map_err(|e| e.to_string())?;
@@ -688,6 +747,7 @@ async fn open_edit_shortcut_window(app: AppHandle, id: String) -> Result<(), Str
     .inner_size(360.0, 490.0)
     .min_inner_size(360.0, 490.0)
     .resizable(false)
+    .devtools(cfg!(debug_assertions))
     .center()
     .build()
     .map_err(|e| e.to_string())?;
@@ -811,17 +871,59 @@ fn add_user_messenger(
     name: String,
     url: String,
     icon: Option<String>,
+    preload: Option<bool>,
 ) -> Result<UserMessenger, String> {
     let parsed: tauri::Url = url.parse().map_err(|e| format!("Invalid URL: {}", e))?;
     let host = parsed.host_str().ok_or("URL has no host")?;
     if is_google_domain(host) {
         return Err("Google services are not supported in the embedded window".into());
     }
-    let m = UserMessenger { id: generate_shortcut_id(), name, url, icon };
+    let m = UserMessenger {
+        id: generate_shortcut_id(),
+        name,
+        url,
+        icon,
+        preload: preload.unwrap_or(false),
+    };
     app.state::<UserMessengers>().0.lock().unwrap().push(m.clone());
     persist_user_messengers(&app)?;
     update_tray(&app);
     Ok(m)
+}
+
+/// Preload flags for the built-in messengers, one entry per label in MESSENGERS
+/// (defaults filled in, so the sidebar never has to guess).
+#[tauri::command]
+fn get_builtin_preload(app: AppHandle) -> HashMap<String, bool> {
+    MESSENGERS
+        .iter()
+        .map(|m| (m.label.to_string(), builtin_preload_enabled(&app, m.label)))
+        .collect()
+}
+
+#[tauri::command]
+fn set_builtin_preload(app: AppHandle, messenger: String, enable: bool) -> Result<(), String> {
+    if !MESSENGERS.iter().any(|m| m.label == messenger) {
+        return Err(format!("Unknown messenger: {}", messenger));
+    }
+    app.state::<BuiltinPreload>().0.lock().unwrap().insert(messenger, enable);
+    persist_builtin_preload(&app)
+}
+
+/// Takes effect on the next launch only — an already-created webview is left
+/// alone, and turning the flag on does not load the page mid-session.
+#[tauri::command]
+fn set_user_messenger_preload(app: AppHandle, id: String, enable: bool) -> Result<(), String> {
+    {
+        let state = app.state::<UserMessengers>();
+        let mut list = state.0.lock().unwrap();
+        let entry = list
+            .iter_mut()
+            .find(|m| m.id == id)
+            .ok_or_else(|| format!("Unknown messenger: {}", id))?;
+        entry.preload = enable;
+    }
+    persist_user_messengers(&app)
 }
 
 #[tauri::command]
@@ -848,9 +950,10 @@ async fn open_add_messenger_window(app: AppHandle) -> Result<(), String> {
         WebviewUrl::App("index.html?view=add-messenger".into()),
     )
     .title("Add Messenger")
-    .inner_size(480.0, 360.0)
-    .min_inner_size(480.0, 360.0)
-    .resizable(false)
+    .inner_size(480.0, 640.0)
+    .min_inner_size(480.0, 420.0)
+    .resizable(true)
+    .devtools(cfg!(debug_assertions))
     .center()
     .build()
     .map_err(|e| e.to_string())?;
@@ -890,6 +993,7 @@ async fn open_bug_report_window(app: AppHandle) -> Result<(), String> {
     .inner_size(560.0, 420.0)
     .min_inner_size(400.0, 320.0)
     .resizable(true)
+    .devtools(cfg!(debug_assertions))
     .center()
     .build()
     .map_err(|e| e.to_string())?;
@@ -902,9 +1006,24 @@ async fn open_custom_shortcut(
     id: String,
     url: String,
 ) -> Result<String, String> {
+    ensure_custom_webview(app, id, url, true).await
+}
+
+/// Shared by shortcuts and user messengers. With `activate == false` the webview
+/// is created off-screen for startup preloading: the session stays warm and
+/// switching to it later is instant, but it never steals the visible slot.
+async fn ensure_custom_webview(
+    app: AppHandle,
+    id: String,
+    url: String,
+    activate: bool,
+) -> Result<String, String> {
     let label = custom_webview_label(&id);
 
     if let Some(webview) = app.get_webview(&label) {
+        if !activate {
+            return Ok(format!("{} already loaded", label));
+        }
         hide_all_messengers(&app);
         // Custom webviews are shrunk to 0×0 while hidden — restore before showing.
         let window = app.get_window("main").ok_or("Main window not found")?;
@@ -943,14 +1062,30 @@ async fn open_custom_shortcut(
         .disable_drag_drop_handler()
         .initialization_script(inject);
 
-    hide_all_messengers(&app);
-    window
+    // Preloaded shortcuts keep the default (suspend) throttling policy: they
+    // don't track anything in the background, so letting WebKit park them after
+    // a few minutes is exactly what we want — the session stays signed in and
+    // wakes up on show.
+    let webview_builder = if activate { webview_builder } else { webview_builder.focused(false) };
+
+    if activate {
+        hide_all_messengers(&app);
+    }
+    let child = window
         .add_child(
             webview_builder,
             LogicalPosition::new(SIDEBAR_WIDTH, 0.0),
             LogicalSize::new(logical.width - SIDEBAR_WIDTH, logical.height),
         )
         .map_err(|e| e.to_string())?;
+
+    if !activate {
+        // Preloaded shortcuts follow the hidden-state convention of
+        // hide_all_messengers: 0×0 so the compositor releases the IOSurface.
+        let _ = child.hide();
+        let _ = child.set_size(LogicalSize::new(0.0, 0.0));
+        return Ok(format!("Preloaded {}", label));
+    }
 
     *app.state::<ActiveMessenger>().0.lock().unwrap() = label.clone();
     let _ = app.emit("active-messenger-changed", label.clone());
@@ -1096,6 +1231,78 @@ fn set_global_shortcut(
     Ok(())
 }
 
+// Gap between two preloaded webviews. Each one spawns a WebContent process and
+// pulls a full web app over the network; starting them back-to-back makes the
+// first seconds after launch noticeably janky, so they are staggered.
+const PRELOAD_STAGGER_MS: u64 = 600;
+
+/// Creates the startup set of webviews on a background thread: the visible one
+/// first, then every messenger flagged for preloading, hidden.
+///
+/// Preloading is what makes background notifications work at all — a messenger
+/// that was never opened has no webview, so its inject script never runs and
+/// never calls `update_unread_count`.
+fn spawn_startup_preload(app: AppHandle) {
+    std::thread::spawn(move || {
+        let builtins: Vec<String> = MESSENGERS
+            .iter()
+            .filter(|m| builtin_preload_enabled(&app, m.label))
+            .map(|m| m.label.to_string())
+            .collect();
+
+        let user_targets: Vec<(String, String)> = app
+            .try_state::<UserMessengers>()
+            .map(|state| {
+                state.0.lock().unwrap()
+                    .iter()
+                    .filter(|m| m.preload)
+                    .map(|m| (m.id.clone(), m.url.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // The first preloaded built-in takes the visible slot. With every flag
+        // off we still open Telegram, so the content area is never blank.
+        let active = builtins
+            .first()
+            .cloned()
+            .unwrap_or_else(|| MESSENGERS[0].label.to_string());
+
+        if let Err(e) = tauri::async_runtime::block_on(ensure_messenger_webview(
+            app.clone(),
+            active.clone(),
+            true,
+        )) {
+            log::error!("Failed to open {} at startup: {}", active, e);
+        }
+
+        for label in builtins.into_iter().filter(|l| *l != active) {
+            std::thread::sleep(Duration::from_millis(PRELOAD_STAGGER_MS));
+            match tauri::async_runtime::block_on(ensure_messenger_webview(
+                app.clone(),
+                label.clone(),
+                false,
+            )) {
+                Ok(_) => log::info!("Preloaded messenger {} in background", label),
+                Err(e) => log::warn!("Failed to preload {}: {}", label, e),
+            }
+        }
+
+        for (id, url) in user_targets {
+            std::thread::sleep(Duration::from_millis(PRELOAD_STAGGER_MS));
+            match tauri::async_runtime::block_on(ensure_custom_webview(
+                app.clone(),
+                id.clone(),
+                url,
+                false,
+            )) {
+                Ok(_) => log::info!("Preloaded user messenger {} in background", id),
+                Err(e) => log::warn!("Failed to preload messenger {}: {}", id, e),
+            }
+        }
+    });
+}
+
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let msg = info.to_string();
@@ -1151,6 +1358,7 @@ pub fn run() {
         .manage(SilenceMode(Mutex::new(false)))
         .manage(CustomShortcuts(Mutex::new(Vec::new())))
         .manage(UserMessengers(Mutex::new(Vec::new())))
+        .manage(BuiltinPreload::default())
         .invoke_handler(tauri::generate_handler![
             open_messenger,
             switch_messenger,
@@ -1176,6 +1384,9 @@ pub fn run() {
             list_user_messengers,
             add_user_messenger,
             remove_user_messenger,
+            get_builtin_preload,
+            set_builtin_preload,
+            set_user_messenger_preload,
             open_add_messenger_window,
             get_recent_logs,
             log_js_error,
@@ -1200,7 +1411,8 @@ pub fn run() {
 
             let sidebar_builder =
                 WebviewBuilder::new("sidebar", WebviewUrl::App("index.html".into()))
-                    .transparent(true);
+                    .transparent(true)
+                    .devtools(cfg!(debug_assertions));
 
             window.add_child(
                 sidebar_builder,
@@ -1212,11 +1424,6 @@ pub fn run() {
             if let Err(e) = apply_vibrancy(&window, NSVisualEffectMaterial::Sidebar, None, None) {
                 log::warn!("Vibrancy unavailable: {}", e);
             }
-
-            let open_handle = handle.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = open_messenger(open_handle, "telegram".into()).await;
-            });
 
             window.on_window_event(move |event| {
                 if let WindowEvent::Resized(_) = event {
@@ -1247,6 +1454,15 @@ pub fn run() {
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default();
             *app.state::<UserMessengers>().0.lock().unwrap() = saved_user_messengers;
+
+            let saved_builtin_preload: HashMap<String, bool> = store
+                .get("builtin_preload")
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            *app.state::<BuiltinPreload>().0.lock().unwrap() = saved_builtin_preload;
+
+            // After the store is loaded, so the preload set reflects saved flags.
+            spawn_startup_preload(handle.clone());
 
             app.handle()
                 .global_shortcut()

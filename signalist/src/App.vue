@@ -56,6 +56,7 @@ interface UserMessenger {
   name: string;
   url: string;
   icon?: string;
+  preload?: boolean;
 }
 
 const newShortcutName = ref("");
@@ -344,13 +345,52 @@ async function addFromCatalog(entry: CatalogEntry) {
       name: entry.name,
       url: entry.url,
       icon: entry.icon,
+      preload: newMessengerPreload.value,
     });
     await emit("messenger-added", m);
-    closeDialogWindow();
+    // The window stays open so the freshly added messenger shows up in the
+    // startup list below and its checkbox can still be flipped.
+    userMessengers.value.push(m);
   } catch (e) {
     addError.value = String(e);
   } finally {
     isAddingMessenger.value = false;
+  }
+}
+
+// ── Startup preloading ──────────────────────────────────────────────────────
+// A messenger that was never opened has no webview, so its inject script never
+// runs and no unread counts or notifications arrive until the first click.
+// Preloading creates the webview hidden at launch; it costs one background
+// WebContent process each, hence the opt-in per messenger.
+const builtinPreload = ref<Record<string, boolean>>({});
+const newMessengerPreload = ref(false);
+
+async function loadBuiltinPreload() {
+  try {
+    builtinPreload.value = await invoke<Record<string, boolean>>("get_builtin_preload");
+  } catch (e) {
+    console.warn("Failed to load preload settings:", e);
+  }
+}
+
+async function toggleBuiltinPreload(label: string) {
+  const next = !builtinPreload.value[label];
+  try {
+    await invoke("set_builtin_preload", { messenger: label, enable: next });
+    builtinPreload.value[label] = next;
+  } catch (e) {
+    addError.value = String(e);
+  }
+}
+
+async function toggleUserPreload(m: UserMessenger) {
+  const next = !m.preload;
+  try {
+    await invoke("set_user_messenger_preload", { id: m.id, enable: next });
+    m.preload = next;
+  } catch (e) {
+    addError.value = String(e);
   }
 }
 
@@ -520,6 +560,7 @@ onMounted(async () => {
 
   if (isAddMessengerView) {
     await loadUserMessengers();
+    await loadBuiltinPreload();
     return;
   }
 
@@ -576,6 +617,16 @@ onMounted(async () => {
       autoIsDark.value = event.payload;
     }),
   );
+
+  // Which view is on screen is decided by the Rust-side startup preload, not
+  // here. If it already picked one before this listener was attached, catch up;
+  // otherwise the `active-messenger-changed` event above delivers it.
+  try {
+    const active = await invoke<string>("get_active_messenger");
+    if (active) activeMessenger.value = active;
+  } catch (e) {
+    console.warn("Failed to read active messenger:", e);
+  }
 
   try {
     const unlistenAction = await onAction(() => {
@@ -635,9 +686,6 @@ async function switchMessenger(label: string) {
   }
 }
 
-if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportView) {
-  openMessenger("telegram");
-}
 </script>
 
 <template>
@@ -669,13 +717,69 @@ if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportVie
       </button>
     </div>
 
-    <p v-if="addError" class="text-[11px] text-red-400 -mt-2">{{ addError }}</p>
+    <label class="flex items-center gap-2 -mt-1 cursor-pointer text-text-muted hover:text-text-primary transition-colors">
+      <input
+        v-model="newMessengerPreload"
+        type="checkbox"
+        class="h-3.5 w-3.5 accent-accent cursor-pointer"
+      >
+      <span class="text-[11px]">Load newly added messenger at startup</span>
+    </label>
 
-    <div class="mt-auto flex justify-end">
+    <div class="w-full border-t border-glass-border" />
+
+    <!-- Startup list: everything already in the sidebar, built-in or added -->
+    <div class="flex flex-col gap-1 min-h-0 flex-1 overflow-y-auto">
+      <h3 class="text-text-primary text-xs font-semibold uppercase tracking-wide opacity-70">
+        Load at startup
+      </h3>
+      <p class="text-[11px] text-text-muted leading-relaxed mb-1">
+        Loads the messenger in the background when the app starts, so unread badges and
+        notifications arrive without opening it first. Each one keeps a background process
+        running — enable only what you need.
+      </p>
+
+      <label
+        v-for="m in messengers"
+        :key="m.label"
+        class="flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-surface-hover cursor-pointer transition-colors"
+      >
+        <input
+          type="checkbox"
+          class="h-4 w-4 accent-accent cursor-pointer"
+          :checked="builtinPreload[m.label] ?? true"
+          @change="toggleBuiltinPreload(m.label)"
+        >
+        <span class="flex h-5 w-5 shrink-0 text-text-muted [&>svg]:h-5 [&>svg]:w-5" v-html="m.icon" />
+        <span class="text-sm text-text-primary flex-1">{{ m.displayName }}</span>
+      </label>
+
+      <label
+        v-for="m in userMessengers"
+        :key="m.id"
+        class="flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-surface-hover cursor-pointer transition-colors"
+      >
+        <input
+          type="checkbox"
+          class="h-4 w-4 accent-accent cursor-pointer"
+          :checked="m.preload ?? false"
+          @change="toggleUserPreload(m)"
+        >
+        <span v-if="m.icon && iconMap[m.icon]" class="flex h-5 w-5 shrink-0 text-text-muted [&>svg]:h-5 [&>svg]:w-5" v-html="iconMap[m.icon]" />
+        <span v-else class="flex h-5 w-5 shrink-0 items-center justify-center text-accent text-xs font-bold">{{ shortcutInitial(m.name) }}</span>
+        <span class="text-sm text-text-primary flex-1">{{ m.name }}</span>
+        <span class="text-[10px] text-text-muted opacity-60 shrink-0" title="Unread counts are only tracked for Telegram and WhatsApp">no badges</span>
+      </label>
+    </div>
+
+    <p v-if="addError" class="text-[11px] text-red-400">{{ addError }}</p>
+
+    <div class="flex items-center justify-between">
+      <span class="text-[10px] text-text-muted opacity-60">Startup changes apply on next launch</span>
       <button
         class="px-4 py-2 rounded-lg text-sm text-text-muted hover:bg-surface-hover cursor-pointer transition-colors"
         @click="closeDialogWindow()"
-      >Cancel</button>
+      >Done</button>
     </div>
   </div>
 

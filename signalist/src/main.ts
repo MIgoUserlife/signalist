@@ -21,4 +21,18 @@ window.addEventListener("unhandledrejection", (event) => {
   }).catch(() => {});
 });
 
+// У production прибираємо нативне меню WebKit (Reload / Inspect Element / Autofill).
+// Поля вводу лишаємо з меню, щоб не втратити Cut/Copy/Paste.
+if (!import.meta.env.DEV) {
+  document.addEventListener(
+    "contextmenu",
+    (event) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, [contenteditable='true']")) return;
+      event.preventDefault();
+    },
+    { capture: true },
+  );
+}
+
 createApp(App).mount("#app");
