@@ -1327,8 +1327,59 @@ fn install_panic_hook() {
     }));
 }
 
+// Signalist relies on BackgroundThrottlingPolicy::Disabled (macOS 14+) for background
+// unread tracking; on older systems messengers would silently stop reporting unread
+// counts after ~5 minutes. Better to refuse to start with a clear message than to run
+// in a degraded state the user can't diagnose.
+const MIN_MACOS_MAJOR_VERSION: u32 = 14;
+
+#[cfg(target_os = "macos")]
+fn check_macos_version_or_exit() {
+    let output = match std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        _ => return, // can't determine version — don't block startup on a detection failure
+    };
+
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let major: u32 = match version.split('.').next().and_then(|s| s.parse().ok()) {
+        Some(m) => m,
+        None => return,
+    };
+
+    if major == 0 || major >= MIN_MACOS_MAJOR_VERSION {
+        return;
+    }
+
+    let lines = [
+        "Signalist потребує macOS 14 Sonoma або новіше.".to_string(),
+        format!("Ваша версія: macOS {}", version),
+        "Оновіть систему через System Settings → General → Software Update, щоб застосунок працював коректно.".to_string(),
+    ];
+    let quoted = lines
+        .iter()
+        .map(|l| format!("\"{}\"", l.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(" & return & return & ");
+    let script = format!(
+        "display dialog {} buttons {{\"OK\"}} default button \"OK\" with icon caution with title \"Signalist\"",
+        quoted
+    );
+
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .status();
+
+    std::process::exit(1);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "macos")]
+    check_macos_version_or_exit();
     install_panic_hook();
     tauri::Builder::default()
         .plugin(

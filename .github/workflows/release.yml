@@ -51,3 +51,9 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Add first-run README to DMG
+        working-directory: signalist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./release/inject-dmg-readme.sh "${{ github.ref_name }}" "release/DMG_README.txt"
