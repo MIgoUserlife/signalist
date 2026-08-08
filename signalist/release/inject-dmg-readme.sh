@@ -38,9 +38,28 @@ for DMG in "${DMGS[@]}"; do
 
   MOUNT_DIR="$WORKDIR/mnt-${BASE}"
   mkdir -p "$MOUNT_DIR"
-  hdiutil attach "$RW_DMG" -mountpoint "$MOUNT_DIR" -nobrowse -quiet -noautoopen
+  # No -nobrowse: Finder must see the volume so AppleScript below can position the icon.
+  hdiutil attach "$RW_DMG" -mountpoint "$MOUNT_DIR" -quiet -noautoopen
 
   cp "$README_SRC" "$MOUNT_DIR/README.txt"
+
+  # A file copied in with plain `cp` has no entry in the existing .DS_Store, so Finder
+  # parks it at a fixed off-window coordinate (observed: {325, 462} in a 660x400 window)
+  # instead of tiling it into view — it's on disk but invisible to the user. Set its
+  # icon position explicitly, below the app/Applications row (180,170) / (480,170).
+  osascript <<APPLESCRIPT
+tell application "Finder"
+    set tgt to (POSIX file "$MOUNT_DIR") as alias
+    open tgt
+    delay 1
+    set position of item "README.txt" of tgt to {330, 290}
+    close window of tgt
+    open tgt
+    update tgt without registering applications
+    delay 2
+    close window of tgt
+end tell
+APPLESCRIPT
 
   hdiutil detach "$MOUNT_DIR" -quiet
 
