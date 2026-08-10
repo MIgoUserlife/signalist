@@ -28,10 +28,56 @@ const NOTIFY_DEBOUNCE_MS: u64 = 800;
 const CHROME_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-// Safari UA for custom shortcuts: matches WKWebView's actual TLS fingerprint,
-// accepted by Google OAuth and Cloudflare bot checks.
-const SAFARI_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-    AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15";
+// Used when the running Safari version can't be determined. Deliberately omits
+// the `Version/… Safari/…` tokens rather than guessing them: a UA that claims a
+// version the engine doesn't match is worse than one that claims nothing.
+const SAFARI_UA_FALLBACK: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+    AppleWebKit/605.1.15 (KHTML, like Gecko)";
+
+/// Safari UA for custom shortcuts, built from the *running* macOS version.
+///
+/// Hardcoding a version here is what broke Cloudflare Turnstile (Linear's email
+/// login and every other site behind it): Turnstile cross-checks the version in
+/// the UA against the JS/CSS APIs the engine actually exposes, and a WKWebView
+/// on macOS 26 claiming Safari 18.3 fails that check. WKWebView is a legitimate
+/// Safari engine and passes on its own — as long as we don't lie about it.
+fn safari_user_agent() -> &'static str {
+    static UA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    UA.get_or_init(|| {
+        let Some((major, minor)) = macos_version() else {
+            return SAFARI_UA_FALLBACK.to_string();
+        };
+        // Safari tracked macOS three majors behind until Apple aligned the two
+        // numbering schemes in macOS 26 (Safari 26): 14 → 17, 15 → 18, 26 → 26.
+        // Minor versions have always matched (macOS 15.3 → Safari 18.3).
+        let safari_major = if major >= 26 { major } else { major + 3 };
+        format!(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+             AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{}.{} Safari/605.1.15",
+            safari_major, minor
+        )
+    })
+}
+
+/// `(major, minor)` of the running macOS, or `None` if `sw_vers` can't be read.
+#[cfg(target_os = "macos")]
+fn macos_version() -> Option<(u32, u32)> {
+    let output = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let mut parts = version.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    (major > 0).then_some((major, minor))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_version() -> Option<(u32, u32)> {
+    None
+}
 
 struct Messenger {
     label: &'static str,
@@ -187,6 +233,21 @@ fn persist_builtin_preload(app: &AppHandle) -> Result<(), String> {
     let json = serde_json::to_value(&flags).map_err(|e| e.to_string())?;
     store.set("builtin_preload", json);
     store.save().map_err(|e| e.to_string())
+}
+
+/// Schemes a page uses to build its own internal frames, not to navigate anywhere.
+///
+/// `on_navigation` fires for *every* navigation, including inside sub-frames —
+/// wry passes the URL straight through with no main-frame filter (see
+/// `decidePolicyForNavigationAction` in `wry/src/wkwebview/navigation.rs`). A
+/// guard that only admits http/https therefore cancels a page's own scaffolding.
+/// That is what broke Cloudflare Turnstile: it builds its widget out of
+/// `about:blank` and `blob:` frames, all of which we were cancelling, so the
+/// challenge died before it could render and Linear reported "Verification
+/// failed". These carry no host to check, and letting a page frame itself is not
+/// a navigation away from it — so they're allowed unconditionally.
+fn is_internal_frame_scheme(url: &tauri::Url) -> bool {
+    matches!(url.scheme(), "about" | "blob")
 }
 
 fn is_google_domain(domain: &str) -> bool {
@@ -594,6 +655,9 @@ async fn ensure_messenger_webview(
 
     let allowed_domains = config.allowed_domains.to_vec();
     let nav_guard = move |url: &tauri::Url| -> bool {
+        if is_internal_frame_scheme(url) {
+            return true;
+        }
         if let Some(host) = url.host_str() {
             let is_allowed = allowed_domains
                 .iter()
@@ -1081,7 +1145,7 @@ async fn ensure_custom_webview(
     let data_store_id = shortcut_id_to_data_store_id(&id);
 
     let nav_guard = move |nav_url: &tauri::Url| -> bool {
-        matches!(nav_url.scheme(), "https" | "http")
+        is_internal_frame_scheme(nav_url) || matches!(nav_url.scheme(), "https" | "http")
     };
 
     let window = app.get_window("main").ok_or("Main window not found")?;
@@ -1090,7 +1154,7 @@ async fn ensure_custom_webview(
     let inject = include_str!("../inject/shortcut.js");
 
     let webview_builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed_url))
-        .user_agent(SAFARI_UA)
+        .user_agent(safari_user_agent())
         .data_store_identifier(data_store_id)
         .on_navigation(nav_guard)
         .devtools(cfg!(debug_assertions))
@@ -1371,27 +1435,16 @@ const MIN_MACOS_MAJOR_VERSION: u32 = 14;
 
 #[cfg(target_os = "macos")]
 fn check_macos_version_or_exit() {
-    let output = match std::process::Command::new("sw_vers")
-        .arg("-productVersion")
-        .output()
-    {
-        Ok(out) if out.status.success() => out,
-        _ => return, // can't determine version — don't block startup on a detection failure
-    };
+    // Detection failure isn't a reason to block startup.
+    let Some((major, minor)) = macos_version() else { return };
 
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let major: u32 = match version.split('.').next().and_then(|s| s.parse().ok()) {
-        Some(m) => m,
-        None => return,
-    };
-
-    if major == 0 || major >= MIN_MACOS_MAJOR_VERSION {
+    if major >= MIN_MACOS_MAJOR_VERSION {
         return;
     }
 
     let lines = [
         "Signalist потребує macOS 14 Sonoma або новіше.".to_string(),
-        format!("Ваша версія: macOS {}", version),
+        format!("Ваша версія: macOS {}.{}", major, minor),
         "Оновіть систему через System Settings → General → Software Update, щоб застосунок працював коректно.".to_string(),
     ];
     let quoted = lines

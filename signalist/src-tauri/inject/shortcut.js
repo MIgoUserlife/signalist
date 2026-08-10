@@ -1,45 +1,16 @@
+// Injected into custom shortcut webviews. Reports the page's theme to the
+// sidebar and nothing else.
+//
+// This script deliberately contains NO anti-bot patches. It used to spoof
+// `navigator.webdriver`, `window.chrome.runtime`, `navigator.languages` and
+// `navigator.plugins` — all shaped for a Chrome UA, while shortcuts actually
+// run under a Safari UA (see `safari_user_agent()` in lib.rs). Real Safari has
+// no `window.chrome` at all, and the overrides landed as non-native getters on
+// the `navigator` instance, so they read as tampering rather than cover for it.
+// Cloudflare Turnstile rejected the result ("Verification failed"), which broke
+// email login on Linear and every other site behind Turnstile. A plain
+// WKWebView with an honest Safari UA passes these checks on its own.
 (() => {
-  try {
-    Object.defineProperty(navigator, 'webdriver', {
-      get: () => undefined,
-      configurable: true,
-    });
-  } catch (_) {}
-
-  try {
-    if (!window.chrome) window.chrome = {};
-    if (!window.chrome.runtime) {
-      window.chrome.runtime = {
-        PlatformOs: { MAC: 'mac' },
-        PlatformArch: { X86_64: 'x86-64' },
-        id: undefined,
-      };
-    }
-  } catch (_) {}
-
-  try {
-    if ((navigator.languages || []).length < 2) {
-      Object.defineProperty(navigator, 'languages', {
-        get: () => ['en-US', 'en'],
-        configurable: true,
-      });
-    }
-  } catch (_) {}
-
-  try {
-    if (!navigator.plugins || navigator.plugins.length === 0) {
-      const fakePlugins = [
-        { name: 'PDF Viewer' },
-        { name: 'Chrome PDF Viewer' },
-        { name: 'WebKit built-in PDF' },
-      ];
-      Object.defineProperty(navigator, 'plugins', {
-        get: () => fakePlugins,
-        configurable: true,
-      });
-    }
-  } catch (_) {}
-
   // --- Theme detection ---
   function resolveInvoke() {
     if (window.__TAURI_INTERNALS__ && typeof window.__TAURI_INTERNALS__.invoke === 'function') {
