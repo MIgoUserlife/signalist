@@ -35,6 +35,19 @@ jobs:
         working-directory: signalist
         run: npm install
 
+      # The release body is built before tauri-action runs, because that step is
+      # what creates the release — there is no editing it afterwards without a
+      # second API call.
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        working-directory: signalist
+        run: |
+          {
+            echo "body<<SIGNALIST_NOTES_EOF"
+            ./release/changelog-section.sh "${{ github.ref_name }}" ../CHANGELOG.md
+            echo "SIGNALIST_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and publish Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -45,9 +58,7 @@ jobs:
           projectPath: signalist
           tagName: ${{ github.ref_name }}
           releaseName: "Signalist ${{ github.ref_name }}"
-          releaseBody: |
-            ## Що нового
-            Перегляньте коміти для деталей.
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
