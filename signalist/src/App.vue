@@ -25,13 +25,16 @@ const isDialogView = _view === "add-shortcut";
 const isEditDialogView = _view === "edit-shortcut";
 const isAddMessengerView = _view === "add-messenger";
 const isBugReportView = _view === "bug-report";
+const isConfirmDeleteView = _view === "confirm-delete";
 const editShortcutId = _params.get("id") ?? "";
+const confirmDeleteId = _params.get("id") ?? "";
+const confirmDeleteKind = _params.get("kind") === "messenger" ? "messenger" : "shortcut";
 
 // True only when running via `npm run tauri:dev` (Vite dev server); false in
 // production builds. Drives the DEV badge that flags this as the dev instance.
 const isDev = import.meta.env.DEV;
 
-if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportView) {
+if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportView && !isConfirmDeleteView) {
   document.documentElement.classList.add('sidebar-view');
 }
 
@@ -325,6 +328,19 @@ async function switchToUserMessenger(m: UserMessenger) {
   }
 }
 
+// Removal is destructive and the × sits on the corner of a 40px icon, so it is
+// far too easy to hit by accident. Both × buttons only open the confirmation
+// window; the actual removal runs here once it reports back.
+function askRemoveUserMessenger(id: string) {
+  invoke("open_confirm_delete_window", { kind: "messenger", id })
+    .catch(e => console.error("Failed to open delete confirmation:", e));
+}
+
+function askRemoveShortcut(id: string) {
+  invoke("open_confirm_delete_window", { kind: "shortcut", id })
+    .catch(e => console.error("Failed to open delete confirmation:", e));
+}
+
 async function removeUserMessenger(id: string) {
   await invoke("remove_user_messenger", { id });
   userMessengers.value = userMessengers.value.filter(m => m.id !== id);
@@ -502,6 +518,43 @@ async function removeShortcut(id: string) {
   }
 }
 
+// ── Confirm-delete dialog view ─────────────────────────────────────────────
+// Runs in its own window. It never deletes anything itself: it looks the target
+// up by id purely to name it in the prompt, then hands the decision back to the
+// sidebar, which owns both the list state and the active-view fallback.
+const confirmDeleteName = ref("");
+const confirmDeleteMissing = ref(false);
+const confirmDeleteBusy = ref(false);
+
+async function loadConfirmDeleteTarget() {
+  try {
+    if (confirmDeleteKind === "messenger") {
+      const list = await invoke<UserMessenger[]>("list_user_messengers");
+      confirmDeleteName.value = list.find(m => m.id === confirmDeleteId)?.name ?? "";
+    } else {
+      const list = await invoke<CustomShortcut[]>("list_custom_shortcuts");
+      confirmDeleteName.value = list.find(s => s.id === confirmDeleteId)?.name ?? "";
+    }
+  } catch (e) {
+    console.warn("Failed to load delete target:", e);
+  }
+  // Already gone (removed elsewhere, or a stale window) — nothing left to confirm.
+  confirmDeleteMissing.value = confirmDeleteName.value === "";
+}
+
+async function approveDelete() {
+  if (confirmDeleteBusy.value) return;
+  confirmDeleteBusy.value = true;
+  try {
+    await emit("confirm-delete-approved", { kind: confirmDeleteKind, id: confirmDeleteId });
+  } catch (e) {
+    console.error("Failed to confirm deletion:", e);
+    confirmDeleteBusy.value = false;
+    return;
+  }
+  closeDialogWindow();
+}
+
 const unlisteners: UnlistenFn[] = [];
 
 const bugReportLogs = ref("");
@@ -564,6 +617,11 @@ onMounted(async () => {
     return;
   }
 
+  if (isConfirmDeleteView) {
+    await loadConfirmDeleteTarget();
+    return;
+  }
+
   if (isDialogView) {
     return;
   }
@@ -612,6 +670,17 @@ onMounted(async () => {
     await listen<UserMessenger>("messenger-added", async (event) => {
       userMessengers.value.push(event.payload);
       await openUserMessenger(event.payload);
+    }),
+    await listen<{ kind: string; id: string }>("confirm-delete-approved", async (event) => {
+      try {
+        if (event.payload.kind === "messenger") {
+          await removeUserMessenger(event.payload.id);
+        } else {
+          await removeShortcut(event.payload.id);
+        }
+      } catch (e) {
+        console.error("Failed to remove item:", e);
+      }
     }),
     await listen<boolean>("theme-update", (event) => {
       autoIsDark.value = event.payload;
@@ -823,6 +892,37 @@ async function switchMessenger(label: string) {
     >Cancel</button>
   </div>
 
+  <!-- ── Confirm delete view ──────────────────────────────────────────────── -->
+  <div
+    v-else-if="isConfirmDeleteView"
+    class="h-screen flex flex-col bg-surface p-5 gap-3 select-none"
+  >
+    <h2 class="text-text-primary text-base font-semibold leading-none">
+      {{ confirmDeleteKind === 'messenger' ? 'Delete messenger' : 'Delete shortcut' }}
+    </h2>
+
+    <p v-if="confirmDeleteMissing" class="text-sm text-text-muted leading-relaxed flex-1">
+      This item is no longer in the sidebar.
+    </p>
+    <p v-else class="text-sm text-text-primary leading-relaxed flex-1">
+      Remove <span class="font-semibold">{{ confirmDeleteName }}</span> from the sidebar?
+      <span class="block mt-1 text-[11px] text-text-muted">This can’t be undone.</span>
+    </p>
+
+    <div class="flex gap-2 justify-end">
+      <button
+        class="px-4 py-2 rounded-lg text-sm text-text-muted hover:bg-surface-hover cursor-pointer transition-colors border border-glass-border"
+        @click="closeDialogWindow()"
+      >{{ confirmDeleteMissing ? 'Close' : 'Cancel' }}</button>
+      <button
+        v-if="!confirmDeleteMissing"
+        :disabled="confirmDeleteBusy"
+        class="px-4 py-2 rounded-lg text-sm font-medium bg-badge-bg text-badge-text hover:opacity-90 cursor-pointer transition-colors disabled:cursor-wait disabled:opacity-60"
+        @click="approveDelete"
+      >Delete</button>
+    </div>
+  </div>
+
   <!-- ── Dialog view (Add / Edit Web Shortcut) ────────────────────────────── -->
   <div
     v-else-if="isDialogView || isEditDialogView"
@@ -1028,7 +1128,7 @@ async function switchMessenger(label: string) {
           <button
             class="absolute -top-1 -right-1 hidden group-hover:flex items-center justify-center h-5 w-5 p-0 rounded-full bg-surface text-text-muted hover:bg-badge-bg hover:text-white text-sm line-height cursor-pointer"
             title="Remove"
-            @click.stop="removeUserMessenger(m.id)"
+            @click.stop="askRemoveUserMessenger(m.id)"
           >×</button>
         </div>
 
@@ -1077,7 +1177,7 @@ async function switchMessenger(label: string) {
           <button
             class="absolute -top-1 -right-1 hidden group-hover:flex items-center justify-center h-5 w-5 p-0 rounded-full bg-surface text-text-muted hover:bg-badge-bg hover:text-white text-sm line-height cursor-pointer"
             title="Remove"
-            @click.stop="removeShortcut(sc.id)"
+            @click.stop="askRemoveShortcut(sc.id)"
           >×</button>
         </div>
 

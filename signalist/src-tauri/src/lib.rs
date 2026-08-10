@@ -754,6 +754,42 @@ async fn open_edit_shortcut_window(app: AppHandle, id: String) -> Result<(), Str
     Ok(())
 }
 
+/// Confirmation prompt shown before a sidebar item is removed. Removal itself
+/// stays in the sidebar (it also has to move the active view away from a
+/// deleted item) — this window only reports the user's answer back over the
+/// `confirm-delete-approved` event.
+///
+/// The label carries the target id so a second × click, while an earlier prompt
+/// is still open, opens its own window instead of silently reusing one that
+/// names a different item. Capabilities match it via the `confirm-delete-*`
+/// glob, so the id is restricted to characters that are valid in a label.
+#[tauri::command]
+async fn open_confirm_delete_window(app: AppHandle, kind: String, id: String) -> Result<(), String> {
+    if kind != "shortcut" && kind != "messenger" {
+        return Err(format!("Unknown delete target kind: {}", kind));
+    }
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("Invalid id".into());
+    }
+    let label = format!("confirm-delete-{}", id);
+    if let Some(win) = app.get_webview_window(&label) {
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    let url = format!("index.html?view=confirm-delete&kind={}&id={}", kind, id);
+    WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
+        .title(if kind == "shortcut" { "Delete Shortcut" } else { "Delete Messenger" })
+        .inner_size(380.0, 190.0)
+        .min_inner_size(380.0, 190.0)
+        .resizable(false)
+        .always_on_top(true)
+        .devtools(cfg!(debug_assertions))
+        .center()
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn update_custom_shortcut(
     app: AppHandle,
@@ -1426,6 +1462,7 @@ pub fn run() {
             toggle_dock_icon,
             open_add_shortcut_window,
             open_edit_shortcut_window,
+            open_confirm_delete_window,
             list_custom_shortcuts,
             add_custom_shortcut,
             update_custom_shortcut,

@@ -19,6 +19,7 @@ commands.allow = [
   "open_custom_shortcut",
   "open_add_shortcut_window",
   "open_edit_shortcut_window",
+  "open_confirm_delete_window",
   "update_custom_shortcut",
   "list_user_messengers",
   "add_user_messenger",
