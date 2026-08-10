@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "shortcut-notifications",
+  "description": "Web Notification API for custom shortcuts and catalog messengers. Deliberately excludes telegram/whatsapp: those report unread counts to the backend, which posts its own notifications — granting them this too would deliver every message twice.",
+  "windows": ["main"],
+  "webviews": ["custom-*"],
+  "remote": {
+    "urls": ["https://*/*"]
+  },
+  "permissions": [
+    "notification:allow-notify",
+    "notification:allow-is-permission-granted",
+    "notification:allow-request-permission"
+  ]
+}

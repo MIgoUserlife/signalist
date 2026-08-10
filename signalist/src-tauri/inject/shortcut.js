@@ -43,4 +43,36 @@
   });
 
   setTimeout(detectAndReportTheme, 2000);
+
+  // --- Fetch patch (Tauri #15216 workaround) ---
+  // Same problem the messenger scripts hit, and for the same reason: a strict
+  // site CSP (Linear's `connect-src` is a typical one) blocks fetch("ipc://…")
+  // at a level that never reaches a JS rejection handler, so Tauri's fetch-first
+  // IPC hangs instead of falling back to window.ipc.postMessage. Rejecting those
+  // URLs ourselves forces the fallback, which the CSP doesn't touch.
+  //
+  // Note what this does *not* cover: Tauri prepends plugin init scripts to the
+  // ones set on the builder (manager/webview.rs, "Prepend all_initialization_
+  // scripts"), and the notification plugin calls `is_permission_granted` inside
+  // its own IIFE — so that one call is already in flight before this patch runs
+  // and still logs a CSP violation. Tauri falls back on its own there; the patch
+  // covers every call after it, ours and the page's alike.
+  (function patchFetch() {
+    const _origFetch = window.fetch.bind(window);
+    const patched = function(url) {
+      let urlStr = '';
+      try {
+        if (typeof url === 'string') urlStr = url;
+        else if (url instanceof URL) urlStr = url.href;
+        else if (url && typeof url.url === 'string') urlStr = url.url; // Request
+      } catch (_e) {}
+      if (urlStr.indexOf('ipc://') === 0 || urlStr.indexOf('http://ipc.localhost') === 0) {
+        return Promise.reject(new TypeError('[Signalist] fetch(ipc://) forced-reject (Tauri #15216 workaround)'));
+      }
+      return _origFetch.apply(this, arguments);
+    };
+    try { window.fetch = patched; } catch (_e) {}
+    try { Object.defineProperty(window, 'fetch', { value: patched, writable: true, configurable: true }); } catch (_e) {}
+    try { globalThis.fetch = patched; } catch (_e) {}
+  })();
 })();

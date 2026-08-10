@@ -36,7 +36,7 @@
         "media-src": "blob: https://web.telegram.org https://web.whatsapp.com",
         "worker-src": "'self' blob:"
       },
-      "capabilities": ["default", "messenger-ipc"]
+      "capabilities": ["default", "messenger-ipc", "shortcut-notifications"]
     }
   },
   "plugins": {
