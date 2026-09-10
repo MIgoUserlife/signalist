@@ -207,6 +207,61 @@ const customShortcuts = ref<CustomShortcut[]>([]);
 const userMessengers = ref<UserMessenger[]>([]);
 const isAddingMessenger = ref(false);
 
+type DownloadStatus = "downloading" | "completed" | "failed";
+
+interface DownloadStatusPayload {
+  id: number;
+  fileName: string;
+  status: DownloadStatus;
+}
+
+const downloadActivity = ref<DownloadStatusPayload[]>([]);
+const downloadCleanupTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
+const downloadIndicator = computed(() => {
+  const active = downloadActivity.value.filter(item => item.status === "downloading");
+  if (active.length > 0) {
+    const latest = active[active.length - 1];
+    const extra = active.length > 1 ? ` (+${active.length - 1})` : "";
+    return {
+      status: "downloading" as const,
+      count: active.length,
+      title: `Завантажується: ${latest.fileName}${extra}`,
+    };
+  }
+
+  const latest = downloadActivity.value[downloadActivity.value.length - 1];
+  if (!latest) return null;
+  return {
+    status: latest.status,
+    count: 0,
+    title: latest.status === "completed"
+      ? `Завантажено в Downloads: ${latest.fileName}`
+      : `Помилка завантаження: ${latest.fileName}`,
+  };
+});
+
+function handleDownloadStatus(payload: DownloadStatusPayload) {
+  const existing = downloadActivity.value.findIndex(item => item.id === payload.id);
+  if (existing === -1) {
+    downloadActivity.value.push(payload);
+  } else {
+    downloadActivity.value.splice(existing, 1);
+    downloadActivity.value.push(payload);
+  }
+
+  const previousTimer = downloadCleanupTimers.get(payload.id);
+  if (previousTimer) clearTimeout(previousTimer);
+
+  if (payload.status !== "downloading") {
+    const timer = setTimeout(() => {
+      downloadActivity.value = downloadActivity.value.filter(item => item.id !== payload.id);
+      downloadCleanupTimers.delete(payload.id);
+    }, payload.status === "failed" ? 10_000 : 6_000);
+    downloadCleanupTimers.set(payload.id, timer);
+  }
+}
+
 function shortcutInitial(name: string): string {
   return name.trim().charAt(0).toUpperCase() || "?";
 }
@@ -685,6 +740,9 @@ onMounted(async () => {
     await listen<boolean>("theme-update", (event) => {
       autoIsDark.value = event.payload;
     }),
+    await listen<DownloadStatusPayload>("download-status", (event) => {
+      handleDownloadStatus(event.payload);
+    }),
   );
 
   // Which view is on screen is decided by the Rust-side startup preload, not
@@ -733,6 +791,8 @@ onMounted(async () => {
 
 onUnmounted(() => {
   unlisteners.forEach(fn => fn());
+  downloadCleanupTimers.forEach(timer => clearTimeout(timer));
+  downloadCleanupTimers.clear();
   document.removeEventListener("click", onDocumentClick);
 });
 
@@ -1197,6 +1257,57 @@ async function switchMessenger(label: string) {
       <!-- Zone 4: Settings -->
       <div class="w-full flex flex-col items-center">
         <div class="w-10 border-t border-glass-border mb-1" />
+
+        <Transition
+          enter-active-class="transition-all duration-200 ease-out"
+          enter-from-class="opacity-0 scale-90"
+          enter-to-class="opacity-100 scale-100"
+          leave-active-class="transition-all duration-150 ease-in"
+          leave-from-class="opacity-100 scale-100"
+          leave-to-class="opacity-0 scale-90"
+        >
+          <div
+            v-if="downloadIndicator"
+            class="relative flex h-10 w-10 items-center justify-center rounded-xl"
+            :class="downloadIndicator.status === 'failed' ? 'text-badge-bg' : 'text-accent'"
+            :title="downloadIndicator.title"
+            role="status"
+            aria-live="polite"
+          >
+            <svg
+              v-if="downloadIndicator.status === 'downloading'"
+              class="animate-pulse"
+              xmlns="http://www.w3.org/2000/svg"
+              width="19" height="19" viewBox="0 0 24 24"
+              fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round"
+            >
+              <path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 21h14"/>
+            </svg>
+            <svg
+              v-else-if="downloadIndicator.status === 'completed'"
+              xmlns="http://www.w3.org/2000/svg"
+              width="19" height="19" viewBox="0 0 24 24"
+              fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round"
+            >
+              <path d="m5 12 4 4L19 6"/>
+            </svg>
+            <svg
+              v-else
+              xmlns="http://www.w3.org/2000/svg"
+              width="19" height="19" viewBox="0 0 24 24"
+              fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round"
+            >
+              <circle cx="12" cy="12" r="9"/><path d="M12 7v6"/><path d="M12 17h.01"/>
+            </svg>
+            <span
+              v-if="downloadIndicator.count > 1"
+              class="absolute right-0 top-0 flex h-4 min-w-4 items-center justify-center rounded-full bg-badge-bg px-1 text-[9px] font-bold leading-none text-badge-text"
+            >{{ downloadIndicator.count }}</span>
+          </div>
+        </Transition>
 
         <!-- Settings gear + accordion panel wrapper -->
         <div ref="settingsWrapper" class="relative w-full flex flex-col items-center mb-3">

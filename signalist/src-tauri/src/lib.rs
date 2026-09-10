@@ -1,20 +1,24 @@
-use std::collections::HashMap;
-use std::sync::Mutex;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+};
 use std::time::Duration;
-use serde::{Serialize, Deserialize};
+use tauri::utils::config::BackgroundThrottlingPolicy;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     path::BaseDirectory,
     tray::TrayIconBuilder,
-    webview::{NewWindowResponse, WebviewBuilder}, AppHandle, Emitter, LogicalPosition,
-    LogicalSize, Manager, State, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowBuilder,
-    WindowEvent,
+    webview::{DownloadEvent, NewWindowResponse, Webview, WebviewBuilder},
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, RunEvent, Runtime, State,
+    WebviewUrl, WebviewWindowBuilder, WindowBuilder, WindowEvent,
 };
-use tauri::utils::config::BackgroundThrottlingPolicy;
-use tauri_plugin_notification::NotificationExt;
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
-use tauri_plugin_store::StoreExt;
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_store::StoreExt;
 #[cfg(target_os = "macos")]
 use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
 
@@ -140,6 +144,127 @@ pub struct HotkeyConfig(pub Mutex<String>);
 pub struct DockHidden(pub Mutex<bool>);
 
 pub struct SilenceMode(pub Mutex<bool>);
+
+#[derive(Debug)]
+struct PendingDownload {
+    id: u64,
+    file_name: String,
+    destination: PathBuf,
+}
+
+#[derive(Default)]
+struct DownloadTrackerInner {
+    pending: HashMap<(String, String), VecDeque<PendingDownload>>,
+    reserved_destinations: HashSet<PathBuf>,
+}
+
+#[derive(Default)]
+pub struct DownloadTracker {
+    next_id: AtomicU64,
+    inner: Mutex<DownloadTrackerInner>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadStatusPayload {
+    id: u64,
+    file_name: String,
+    status: &'static str,
+}
+
+fn unique_download_destination(path: &Path, reserved: &HashSet<PathBuf>) -> PathBuf {
+    if !path.exists() && !reserved.contains(path) {
+        return path.to_path_buf();
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
+    let (stem, extension) = file_name
+        .split_once('.')
+        .map(|(stem, extension)| (stem, format!(".{extension}")))
+        .unwrap_or((file_name, String::new()));
+
+    for counter in 1.. {
+        let candidate = parent.join(format!("{stem} ({counter}){extension}"));
+        if !candidate.exists() && !reserved.contains(&candidate) {
+            return candidate;
+        }
+    }
+
+    unreachable!("an available download filename must eventually be found")
+}
+
+fn handle_download<R: Runtime>(webview: Webview<R>, event: DownloadEvent<'_>) -> bool {
+    let tracker = webview.state::<DownloadTracker>();
+    let webview_label = webview.label().to_string();
+
+    match event {
+        DownloadEvent::Requested { url, destination } => {
+            // Wry proposes the user's Downloads directory. Resolve collisions
+            // again while downloads are in flight, before their files may exist.
+            let mut inner = tracker.inner.lock().unwrap();
+            *destination = unique_download_destination(destination, &inner.reserved_destinations);
+            let file_name = destination
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "download".to_string());
+            let id = tracker.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+            let key = (webview_label, url.to_string());
+
+            inner.reserved_destinations.insert(destination.clone());
+            inner
+                .pending
+                .entry(key)
+                .or_default()
+                .push_back(PendingDownload {
+                    id,
+                    file_name: file_name.clone(),
+                    destination: destination.clone(),
+                });
+            drop(inner);
+
+            let _ = webview.emit(
+                "download-status",
+                DownloadStatusPayload {
+                    id,
+                    file_name,
+                    status: "downloading",
+                },
+            );
+            true
+        }
+        DownloadEvent::Finished { url, success, .. } => {
+            let key = (webview_label, url.to_string());
+            let mut inner = tracker.inner.lock().unwrap();
+            let pending = inner.pending.get_mut(&key).and_then(VecDeque::pop_front);
+            let remove_queue = inner.pending.get(&key).is_some_and(VecDeque::is_empty);
+            if remove_queue {
+                inner.pending.remove(&key);
+            }
+
+            if let Some(pending) = pending {
+                inner.reserved_destinations.remove(&pending.destination);
+                drop(inner);
+                let status = if success { "completed" } else { "failed" };
+                let _ = webview.emit(
+                    "download-status",
+                    DownloadStatusPayload {
+                        id: pending.id,
+                        file_name: pending.file_name,
+                        status,
+                    },
+                );
+            } else {
+                log::warn!("Download finished without a matching request: {}", url);
+            }
+            true
+        }
+        _ => true,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomShortcut {
@@ -690,6 +815,7 @@ async fn ensure_messenger_webview(
         .user_agent(CHROME_UA)
         .data_store_identifier(config.data_store_id)
         .on_navigation(nav_guard)
+        .on_download(handle_download)
         .devtools(cfg!(debug_assertions))
         // Without this, WebKit throttles timers of a hidden view and fully
         // suspends it after ~5 minutes — the inject script would stop reporting
@@ -1174,6 +1300,7 @@ async fn ensure_custom_webview(
             NewWindowResponse::Deny
         })
         .on_navigation(nav_guard)
+        .on_download(handle_download)
         .devtools(cfg!(debug_assertions))
         // Same as messengers: allow native HTML5 file drops into the web app.
         .disable_drag_drop_handler()
@@ -1513,6 +1640,7 @@ pub fn run() {
         .manage(HotkeyConfig(Mutex::new(String::new())))
         .manage(DockHidden(Mutex::new(false)))
         .manage(SilenceMode(Mutex::new(false)))
+        .manage(DownloadTracker::default())
         .manage(CustomShortcuts(Mutex::new(Vec::new())))
         .manage(UserMessengers(Mutex::new(Vec::new())))
         .manage(BuiltinPreload::default())
