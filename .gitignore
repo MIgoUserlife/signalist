@@ -28,3 +28,6 @@ dist-ssr
 AGENTS.md
 .claude
 CLAUDE.md
+.agents
+docs/agent-workflow.md
+docs/tasks
