@@ -6,8 +6,9 @@ use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     path::BaseDirectory,
     tray::TrayIconBuilder,
-    webview::WebviewBuilder, AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, State,
-    RunEvent, WebviewUrl, WebviewWindowBuilder, WindowBuilder, WindowEvent,
+    webview::{NewWindowResponse, WebviewBuilder}, AppHandle, Emitter, LogicalPosition,
+    LogicalSize, Manager, State, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowBuilder,
+    WindowEvent,
 };
 use tauri::utils::config::BackgroundThrottlingPolicy;
 use tauri_plugin_notification::NotificationExt;
@@ -268,6 +269,12 @@ fn open_in_chrome(url: &str) {
         .arg("Google Chrome")
         .arg(url)
         .spawn();
+}
+
+fn open_in_system_browser(url: &str) {
+    if let Err(error) = std::process::Command::new("open").arg(url).spawn() {
+        log::warn!("Failed to open URL in the system browser: {}", error);
+    }
 }
 
 #[tauri::command]
@@ -1156,6 +1163,16 @@ async fn ensure_custom_webview(
     let webview_builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed_url))
         .user_agent(safari_user_agent())
         .data_store_identifier(data_store_id)
+        // WKWebView otherwise discards `target="_blank"` and `window.open`
+        // requests because a child webview has nowhere to create a new tab.
+        // Custom shortcuts and user messengers hand those URLs to the user's
+        // default browser instead of creating another embedded window.
+        .on_new_window(|url, _features| {
+            if matches!(url.scheme(), "https" | "http") {
+                open_in_system_browser(url.as_str());
+            }
+            NewWindowResponse::Deny
+        })
         .on_navigation(nav_guard)
         .devtools(cfg!(debug_assertions))
         // Same as messengers: allow native HTML5 file drops into the web app.
