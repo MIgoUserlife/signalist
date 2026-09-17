@@ -739,31 +739,87 @@ fn generate_shortcut_id() -> String {
 /// launch, with no way back short of deleting the file by hand in
 /// `~/Library/Application Support`.
 ///
+/// The file is read and parsed here rather than inferred from an `Err` out of
+/// `app.store()`: `tauri-plugin-store` 2.4.3 swallows the load error
+/// (`let _ = store_inner.load()`), so a truncated file yields `Ok` with an
+/// empty cache and looks exactly like a first run with settings on disk. The
+/// order matters too — the plugin caches the store instance by path, so once
+/// `app.store()` has run, renaming the file no longer changes what is loaded.
+///
 /// The returned flag is false when the settings on this run do not describe the
-/// user's actual configuration — the file was missing, or had to be moved
-/// aside. `spawn_orphan_data_store_cleanup` needs to know: an empty shortcut
-/// list is indistinguishable from "every session on disk is an orphan".
+/// user's actual configuration — the file was missing, unreadable, or had to be
+/// moved aside. `spawn_orphan_data_store_cleanup` needs to know: an empty
+/// shortcut list is indistinguishable from "every session on disk is an orphan".
 fn open_settings_store(
     app: &AppHandle,
 ) -> Result<(std::sync::Arc<tauri_plugin_store::Store<tauri::Wry>>, bool), Box<dyn std::error::Error>> {
-    let existed = app
-        .path()
-        .app_config_dir()
-        .map(|dir| dir.join(SETTINGS_STORE).exists())
-        .unwrap_or(false);
-    if let Ok(store) = app.store(SETTINGS_STORE) {
-        return Ok((store, existed));
+    let Ok(dir) = app.path().app_config_dir() else {
+        log::error!("No app config dir; starting from default settings");
+        return Ok((app.store(SETTINGS_STORE)?, false));
+    };
+    let path = dir.join(SETTINGS_STORE);
+    if !path.exists() {
+        return Ok((app.store(SETTINGS_STORE)?, false));
     }
-    log::error!("Settings store is unreadable; moving it aside and starting from defaults");
-    if let Ok(dir) = app.path().app_config_dir() {
-        let path = dir.join(SETTINGS_STORE);
-        if path.exists() {
-            if let Err(e) = std::fs::rename(&path, dir.join("settings.json.corrupt")) {
+
+    let parsed = std::fs::read(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| {
+            serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes)
+                .map_err(|e| e.to_string())
+        });
+    match parsed {
+        Ok(_) => Ok((app.store(SETTINGS_STORE)?, true)),
+        Err(e) => {
+            log::error!(
+                "Settings store is unreadable ({}); moving it aside and starting from defaults",
+                e
+            );
+            // Timestamped, so a second corruption does not overwrite the copy a
+            // user may still want to salvage their shortcut list from.
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let aside = dir.join(format!("settings.json.corrupt-{}", stamp));
+            if let Err(e) = std::fs::rename(&path, &aside) {
                 log::error!("Failed to move the corrupt settings store aside: {}", e);
+            } else {
+                log::info!("Corrupt settings store kept at {}", aside.display());
             }
+            Ok((app.store(SETTINGS_STORE)?, false))
         }
     }
-    Ok((app.store(SETTINGS_STORE)?, false))
+}
+
+/// Reads a list-valued settings key, reporting whether it can still be trusted.
+///
+/// A present-but-unparsable key is not the same as an absent one. Degrading to
+/// an empty list silently hands `spawn_orphan_data_store_cleanup` a keep-set
+/// with no shortcuts in it, and the sweep then erases the logged-in sessions of
+/// shortcuts that are still configured. A single bad element — or a new field
+/// added to `CustomShortcut` without `#[serde(default)]` — is enough to trigger
+/// that, so a parse failure clears the trust flag instead.
+fn load_settings_list<T: serde::de::DeserializeOwned>(
+    store: &tauri_plugin_store::Store<tauri::Wry>,
+    key: &str,
+    trusted: &mut bool,
+) -> Vec<T> {
+    let Some(value) = store.get(key) else {
+        return Vec::new();
+    };
+    match serde_json::from_value(value) {
+        Ok(list) => list,
+        Err(e) => {
+            log::error!(
+                "Settings key '{}' is present but could not be parsed ({}); treating the settings as untrusted",
+                key,
+                e
+            );
+            *trusted = false;
+            Vec::new()
+        }
+    }
 }
 
 fn persist_custom_shortcuts(app: &AppHandle) -> Result<(), String> {
@@ -2071,26 +2127,22 @@ pub fn run() {
                 _ => {}
             });
 
-            let (store, store_trusted) = open_settings_store(app.handle())?;
+            let (store, mut store_trusted) = open_settings_store(app.handle())?;
             let saved_hotkey = store
                 .get("hotkey")
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
                 .unwrap_or_else(|| "Super+Shift+S".to_string());
             *app.state::<HotkeyConfig>().0.lock().unwrap() = saved_hotkey.clone();
 
-            let saved_shortcuts: Vec<CustomShortcut> = store
-                .get("custom_shortcuts")
-                .and_then(|v| serde_json::from_value(v).ok())
-                .unwrap_or_default();
+            let saved_shortcuts: Vec<CustomShortcut> =
+                load_settings_list(&store, "custom_shortcuts", &mut store_trusted);
             *app.state::<CustomShortcuts>().0.lock().unwrap() = saved_shortcuts;
 
             let saved_silence = store.get("silence_mode").and_then(|v| v.as_bool()).unwrap_or(false);
             *app.state::<SilenceMode>().0.lock().unwrap() = saved_silence;
 
-            let saved_user_messengers: Vec<UserMessenger> = store
-                .get("user_messengers")
-                .and_then(|v| serde_json::from_value(v).ok())
-                .unwrap_or_default();
+            let saved_user_messengers: Vec<UserMessenger> =
+                load_settings_list(&store, "user_messengers", &mut store_trusted);
             *app.state::<UserMessengers>().0.lock().unwrap() = saved_user_messengers;
 
             let saved_builtin_preload: HashMap<String, bool> = store
