@@ -33,4 +33,7 @@ commands.allow = [
   "open_bug_report_window",
   "open_in_browser",
   "show_window",
+  "get_global_shortcut",
+  "set_global_shortcut",
+  "toggle_dock_icon",
 ]

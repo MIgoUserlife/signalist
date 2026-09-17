@@ -12,8 +12,8 @@ use tauri::{
     path::BaseDirectory,
     tray::TrayIconBuilder,
     webview::{DownloadEvent, NewWindowResponse, Webview, WebviewBuilder},
-    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, RunEvent, Runtime, State,
-    WebviewUrl, WebviewWindowBuilder, WindowBuilder, WindowEvent,
+    AppHandle, Emitter, EventTarget, LogicalPosition, LogicalSize, Manager, RunEvent, Runtime,
+    State, WebviewUrl, WebviewWindowBuilder, WindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
@@ -23,6 +23,8 @@ use tauri_plugin_store::StoreExt;
 use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
 
 const SIDEBAR_WIDTH: f64 = 64.0;
+
+const SETTINGS_STORE: &str = "settings.json";
 
 // How long the unread count must remain stable before we post a notification.
 // Coalesces rapid changes during Telegram's message-sync bursts so the value
@@ -182,10 +184,13 @@ fn unique_download_destination(path: &Path, reserved: &HashSet<PathBuf>) -> Path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("download");
-    let (stem, extension) = file_name
-        .split_once('.')
-        .map(|(stem, extension)| (stem, format!(".{extension}")))
-        .unwrap_or((file_name, String::new()));
+    // Split on the LAST dot, and only when it actually separates a stem from an
+    // extension: `archive.2026.zip` must become `archive.2026 (1).zip`, and a
+    // dotfile such as `.env` must stay `.env (1)`, not ` (1).env`.
+    let (stem, extension) = match file_name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => (stem, format!(".{extension}")),
+        _ => (file_name, String::new()),
+    };
 
     for counter in 1.. {
         let candidate = parent.join(format!("{stem} ({counter}){extension}"));
@@ -195,6 +200,80 @@ fn unique_download_destination(path: &Path, reserved: &HashSet<PathBuf>) -> Path
     }
 
     unreachable!("an available download filename must eventually be found")
+}
+
+/// Sends an internal event to the sidebar and nowhere else.
+///
+/// The only way internal events may be emitted. `Emitter::emit` is **not**
+/// scoped to the webview it is called on — it delegates to the app-wide
+/// manager, so a plain `emit` reaches every embedded remote page too. Keeping
+/// the target in one place makes "no bare `.emit(` in this file" greppable.
+fn register_toggle_shortcut(
+    app: &AppHandle,
+    accelerator: &str,
+) -> Result<(), tauri_plugin_global_shortcut::Error> {
+    app.global_shortcut().on_shortcut(accelerator, |handle, _, event| {
+        if event.state() == ShortcutState::Pressed {
+            toggle_window(handle);
+        }
+    })
+}
+
+/// Records which webview is on screen and tells the sidebar about it.
+///
+/// The two always move together — splitting them is how the state and the
+/// sidebar's highlight drift apart.
+fn set_active_messenger(app: &AppHandle, label: String) {
+    *app.state::<ActiveMessenger>().0.lock().unwrap() = label.clone();
+    emit_to_sidebar(app, "active-messenger-changed", label);
+}
+
+fn emit_to_sidebar<R: Runtime, P: Serialize + Clone>(app: &AppHandle<R>, event: &str, payload: P) {
+    let _ = app.emit_to(EventTarget::webview("sidebar"), event, payload);
+}
+
+fn emit_download_status<R: Runtime>(app: &AppHandle<R>, payload: DownloadStatusPayload) {
+    emit_to_sidebar(app, "download-status", payload);
+}
+
+/// Releases everything a webview still had in flight.
+///
+/// Closing a webview destroys its wry download delegate, so neither
+/// `download_did_finish` nor `download_did_fail` ever fires for downloads that
+/// were still running. Without this sweep the reserved destinations would be
+/// held for the lifetime of the process (renaming every later download of the
+/// same name to `name (1)`) and the sidebar would keep showing "downloading"
+/// forever.
+fn purge_webview_downloads<R: Runtime>(app: &AppHandle<R>, webview_label: &str) {
+    let Some(tracker) = app.try_state::<DownloadTracker>() else {
+        return;
+    };
+    let mut abandoned: Vec<PendingDownload> = Vec::new();
+    {
+        let mut inner = tracker.inner.lock().unwrap();
+        inner.pending.retain(|(label, _), queue| {
+            if label == webview_label {
+                abandoned.extend(std::mem::take(queue));
+                false
+            } else {
+                true
+            }
+        });
+        for pending in &abandoned {
+            inner.reserved_destinations.remove(&pending.destination);
+        }
+    }
+
+    for pending in abandoned {
+        emit_download_status(
+            app,
+            DownloadStatusPayload {
+                id: pending.id,
+                file_name: pending.file_name,
+                status: "failed",
+            },
+        );
+    }
 }
 
 fn handle_download<R: Runtime>(webview: Webview<R>, event: DownloadEvent<'_>) -> bool {
@@ -226,8 +305,8 @@ fn handle_download<R: Runtime>(webview: Webview<R>, event: DownloadEvent<'_>) ->
                 });
             drop(inner);
 
-            let _ = webview.emit(
-                "download-status",
+            emit_download_status(
+                webview.app_handle(),
                 DownloadStatusPayload {
                     id,
                     file_name,
@@ -246,11 +325,17 @@ fn handle_download<R: Runtime>(webview: Webview<R>, event: DownloadEvent<'_>) ->
             }
 
             if let Some(pending) = pending {
+                // macOS never reports which file finished (`Finished.path` is
+                // always `None` there), so with several downloads of the same
+                // URL in flight the queue order is all we have and the popped
+                // entry may not be the one that just finished. Unfixable from
+                // here; the on-disk check in unique_download_destination is
+                // what keeps a misattributed release from overwriting anything.
                 inner.reserved_destinations.remove(&pending.destination);
                 drop(inner);
                 let status = if success { "completed" } else { "failed" };
-                let _ = webview.emit(
-                    "download-status",
+                emit_download_status(
+                    webview.app_handle(),
                     DownloadStatusPayload {
                         id: pending.id,
                         file_name: pending.file_name,
@@ -354,7 +439,7 @@ fn builtin_preload_enabled(app: &AppHandle, label: &str) -> bool {
 }
 
 fn persist_builtin_preload(app: &AppHandle) -> Result<(), String> {
-    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
     let flags = app.state::<BuiltinPreload>().0.lock().unwrap().clone();
     let json = serde_json::to_value(&flags).map_err(|e| e.to_string())?;
     store.set("builtin_preload", json);
@@ -388,14 +473,10 @@ fn is_google_domain(domain: &str) -> bool {
         || d.ends_with(".youtube.com")
 }
 
-fn open_in_chrome(url: &str) {
-    let _ = std::process::Command::new("open")
-        .arg("-a")
-        .arg("Google Chrome")
-        .arg(url)
-        .spawn();
-}
-
+/// Hands a URL to the user's default browser.
+///
+/// Not `open -a "Google Chrome"`: `spawn` succeeds as soon as `/usr/bin/open`
+/// starts, so a missing Chrome failed silently and the click did nothing.
 fn open_in_system_browser(url: &str) {
     if let Err(error) = std::process::Command::new("open").arg(url).spawn() {
         log::warn!("Failed to open URL in the system browser: {}", error);
@@ -408,7 +489,7 @@ fn open_in_browser(url: String) -> Result<(), String> {
     if !matches!(parsed.scheme(), "https" | "http") {
         return Err("Only HTTP/HTTPS URLs are supported".into());
     }
-    open_in_chrome(&url);
+    open_in_system_browser(&url);
     Ok(())
 }
 
@@ -422,14 +503,101 @@ fn shortcut_id_to_data_store_id(shortcut_id: &str) -> [u8; 16] {
     result
 }
 
+/// Formats a data-store UUID the way WebKit names its on-disk directory.
+fn data_store_dir_name(id: [u8; 16]) -> String {
+    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]
+    )
+}
+
+/// Everything that has to happen when a shortcut or user messenger goes away:
+/// close its webview, release its in-flight downloads, erase its session.
+///
+/// Shared so the next teardown step only has to be written once — the two
+/// callers differ solely in which list they then drop the entry from.
+fn teardown_custom_entry(app: &AppHandle, id: &str) -> Result<(), String> {
+    validate_shortcut_id(id)?;
+    let label = custom_webview_label(id);
+    if let Some(webview) = app.get_webview(&label) {
+        webview.close().map_err(|e| e.to_string())?;
+        purge_webview_downloads(app, &label);
+    }
+    purge_shortcut_data_store(app, id);
+    Ok(())
+}
+
+/// Deletes the cookies and local storage of a removed shortcut or user messenger.
+///
+/// An identifier-keyed `WKWebsiteDataStore` lives in
+/// `~/Library/WebKit/<bundle id>/WebsiteDataStore/<uuid>`. Closing the webview
+/// leaves it untouched, so a user who signs in to a site, then deletes the
+/// shortcut to get that account off the machine, would otherwise keep an
+/// authenticated session on disk with no UI able to reach it.
+fn purge_shortcut_data_store(app: &AppHandle, shortcut_id: &str) {
+    let dir_name = data_store_dir_name(shortcut_id_to_data_store_id(shortcut_id));
+    let Ok(home) = app.path().home_dir() else {
+        return;
+    };
+    let path = home
+        .join("Library/WebKit")
+        .join(&app.config().identifier)
+        .join("WebsiteDataStore")
+        .join(&dir_name);
+    match std::fs::remove_dir_all(&path) {
+        Ok(()) => {}
+        // Not an error the user can act on, but worth seeing: it also means
+        // WebKit moved this directory and the session was *not* erased.
+        Err(e) => log::warn!("Data store {} was not removed: {}", dir_name, e),
+    }
+}
+
+/// Rejects ids that would not survive being interpolated into a webview URL.
+///
+/// Ids are generated as hex, but a hand-edited or migrated `settings.json` can
+/// carry anything; a `#` or `&` in one silently rewrites the dialog's query
+/// string, and it then loads with the wrong — or an empty — target.
+fn validate_shortcut_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("Invalid id".into());
+    }
+    Ok(())
+}
+
 fn generate_shortcut_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     format!("{:08x}{:08x}", d.as_secs(), d.subsec_nanos())
 }
 
+/// Opens `settings.json`, moving it aside if it cannot be parsed.
+///
+/// A crash or a full disk during `store.save()` — and every mutation calls it —
+/// can leave a half-written file behind. Panicking on that turned one bad write
+/// into an app that crashed before creating its window on every subsequent
+/// launch, with no way back short of deleting the file by hand in
+/// `~/Library/Application Support`.
+fn open_settings_store(
+    app: &AppHandle,
+) -> Result<std::sync::Arc<tauri_plugin_store::Store<tauri::Wry>>, Box<dyn std::error::Error>> {
+    if let Ok(store) = app.store(SETTINGS_STORE) {
+        return Ok(store);
+    }
+    log::error!("Settings store is unreadable; moving it aside and starting from defaults");
+    if let Ok(dir) = app.path().app_config_dir() {
+        let path = dir.join(SETTINGS_STORE);
+        if path.exists() {
+            if let Err(e) = std::fs::rename(&path, dir.join("settings.json.corrupt")) {
+                log::error!("Failed to move the corrupt settings store aside: {}", e);
+            }
+        }
+    }
+    Ok(app.store(SETTINGS_STORE)?)
+}
+
 fn persist_custom_shortcuts(app: &AppHandle) -> Result<(), String> {
-    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
     let shortcuts = app.state::<CustomShortcuts>().0.lock().unwrap().clone();
     let json = serde_json::to_value(&shortcuts).map_err(|e| e.to_string())?;
     store.set("custom_shortcuts", json);
@@ -437,7 +605,7 @@ fn persist_custom_shortcuts(app: &AppHandle) -> Result<(), String> {
 }
 
 fn persist_user_messengers(app: &AppHandle) -> Result<(), String> {
-    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
     let messengers = app.state::<UserMessengers>().0.lock().unwrap().clone();
     let json = serde_json::to_value(&messengers).map_err(|e| e.to_string())?;
     store.set("user_messengers", json);
@@ -543,8 +711,18 @@ fn do_toggle_dock_icon(app: &AppHandle) {
 }
 
 #[tauri::command]
-fn update_sidebar_theme_from_webview(app: AppHandle, is_dark: bool) {
-    let _ = app.emit("theme-update", is_dark);
+fn update_sidebar_theme_from_webview(webview: Webview, app: AppHandle, is_dark: bool) {
+    // Every inject script reports its theme ~2s after load, including in the
+    // hidden webviews created by the startup preload — so without this gate the
+    // sidebar ends up wearing the theme of a view the user cannot see, and any
+    // embedded page can flip the host UI at will. Only the active view counts.
+    let Some(state) = app.try_state::<ActiveMessenger>() else { return };
+    // `ActiveMessenger` holds the webview label, for built-ins and `custom-*` alike.
+    let active = state.0.lock().unwrap().clone();
+    if active.is_empty() || webview.label() != active {
+        return;
+    }
+    emit_to_sidebar(&app, "theme-update", is_dark);
 }
 
 #[tauri::command]
@@ -568,7 +746,7 @@ fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
     };
 
     update_tray(&app);
-    let _ = app.emit("unread-update", UnreadUpdatePayload { messenger: messenger.clone(), count });
+    emit_to_sidebar(&app, "unread-update", UnreadUpdatePayload { messenger: messenger.clone(), count });
 
     handle_notify_change(&app, &messenger, count, previous_count);
 }
@@ -619,19 +797,30 @@ fn handle_notify_change(app: &AppHandle, messenger: &str, count: u32, previous_c
                 t.0.lock().unwrap().get(&messenger_clone).map(|s| s.pending_gen).unwrap_or(0)
             })
         };
+        // The slot stays ours for the whole run. A change that lands while we
+        // are firing bumps pending_gen and spawns nothing, so releasing
+        // in_flight before the final generation check would lose that change
+        // entirely — the user would only be notified at the count after next.
         loop {
-            let Some(gen_at_sleep) = read_gen() else { return };
-            std::thread::sleep(Duration::from_millis(NOTIFY_DEBOUNCE_MS));
-            let Some(gen_now) = read_gen() else { return };
-            if gen_now == gen_at_sleep {
-                break;
+            let gen_before_fire = loop {
+                let Some(gen_at_sleep) = read_gen() else { return };
+                std::thread::sleep(Duration::from_millis(NOTIFY_DEBOUNCE_MS));
+                let Some(gen_now) = read_gen() else { return };
+                if gen_now == gen_at_sleep {
+                    break gen_now;
+                }
+            };
+            fire_notification_if_stable(&app_clone, &messenger_clone);
+            let Some(gen_after_fire) = read_gen() else { return };
+            if gen_after_fire == gen_before_fire {
+                if let Some(tracker) = app_clone.try_state::<NotifyTracker>() {
+                    if let Some(entry) = tracker.0.lock().unwrap().get_mut(&messenger_clone) {
+                        entry.in_flight = false;
+                    }
+                }
+                return;
             }
-        }
-        fire_notification_if_stable(&app_clone, &messenger_clone);
-        if let Some(tracker) = app_clone.try_state::<NotifyTracker>() {
-            if let Some(entry) = tracker.0.lock().unwrap().get_mut(&messenger_clone) {
-                entry.in_flight = false;
-            }
+            // Changed while firing — run another debounce window, slot still ours.
         }
     });
 }
@@ -769,11 +958,7 @@ async fn ensure_messenger_webview(
         hide_all_messengers(&app);
         webview.show().map_err(|e| e.to_string())?;
         webview.set_focus().map_err(|e| e.to_string())?;
-        let state = app.state::<ActiveMessenger>();
-        let mut active = state.0.lock().unwrap();
-        *active = messenger.clone();
-        drop(active);
-        let _ = app.emit("active-messenger-changed", messenger.clone());
+        set_active_messenger(&app, messenger.clone());
         return Ok(format!("Focused existing {}", config.label));
     }
 
@@ -795,7 +980,7 @@ async fn ensure_messenger_webview(
                 .iter()
                 .any(|d| host == *d || host.ends_with(&format!(".{}", d)));
             if !is_allowed && matches!(url.scheme(), "https" | "http") {
-                open_in_chrome(url.as_str());
+                open_in_system_browser(url.as_str());
             }
             is_allowed
         } else {
@@ -851,11 +1036,7 @@ async fn ensure_messenger_webview(
         return Ok(format!("Preloaded {}", config.label));
     }
 
-    let state = app.state::<ActiveMessenger>();
-    let mut active = state.0.lock().unwrap();
-    *active = messenger.clone();
-    drop(active);
-    let _ = app.emit("active-messenger-changed", messenger.clone());
+    set_active_messenger(&app, messenger.clone());
 
     Ok(format!("Created {}", config.label))
 }
@@ -876,11 +1057,7 @@ fn switch_messenger(app: AppHandle, messenger: String) -> Result<(), String> {
     webview.show().map_err(|e| e.to_string())?;
     webview.set_focus().map_err(|e| e.to_string())?;
 
-    let state = app.state::<ActiveMessenger>();
-    let mut active = state.0.lock().unwrap();
-    *active = messenger.clone();
-    drop(active);
-    let _ = app.emit("active-messenger-changed", messenger);
+    set_active_messenger(&app, messenger);
 
     Ok(())
 }
@@ -894,6 +1071,7 @@ fn close_messenger(app: AppHandle, messenger: String) -> Result<(), String> {
 
     if let Some(webview) = app.get_webview(config.label) {
         webview.close().map_err(|e| e.to_string())?;
+        purge_webview_downloads(&app, config.label);
     }
 
     Ok(())
@@ -930,6 +1108,7 @@ async fn open_add_shortcut_window(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn open_edit_shortcut_window(app: AppHandle, id: String) -> Result<(), String> {
+    validate_shortcut_id(&id)?;
     if let Some(win) = app.get_webview_window("edit-shortcut") {
         let _ = win.set_focus();
         return Ok(());
@@ -965,9 +1144,7 @@ async fn open_confirm_delete_window(app: AppHandle, kind: String, id: String) ->
     if kind != "shortcut" && kind != "messenger" {
         return Err(format!("Unknown delete target kind: {}", kind));
     }
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-        return Err("Invalid id".into());
-    }
+    validate_shortcut_id(&id)?;
     let label = format!("confirm-delete-{}", id);
     if let Some(win) = app.get_webview_window(&label) {
         let _ = win.set_focus();
@@ -1020,12 +1197,13 @@ fn update_custom_shortcut(
     if url_changed {
         if let Some(webview) = app.get_webview(&label) {
             let _ = webview.close();
+            purge_webview_downloads(&app, &label);
         }
     }
 
     persist_custom_shortcuts(&app)?;
     update_tray(&app);
-    let _ = app.emit("shortcut-updated", updated.clone());
+    emit_to_sidebar(&app, "shortcut-updated", updated.clone());
     Ok(updated)
 }
 
@@ -1046,7 +1224,7 @@ fn add_custom_shortcut(app: AppHandle, name: String, url: String, icon: Option<S
     app.state::<CustomShortcuts>().0.lock().unwrap().push(sc.clone());
     persist_custom_shortcuts(&app)?;
     update_tray(&app);
-    let _ = app.emit("shortcut-added", sc.clone());
+    emit_to_sidebar(&app, "shortcut-added", sc.clone());
     Ok(sc)
 }
 
@@ -1083,10 +1261,7 @@ fn reorder_custom_shortcuts(app: AppHandle, ids: Vec<String>) -> Result<Vec<Cust
 
 #[tauri::command]
 fn remove_custom_shortcut(app: AppHandle, id: String) -> Result<(), String> {
-    let label = custom_webview_label(&id);
-    if let Some(webview) = app.get_webview(&label) {
-        webview.close().map_err(|e| e.to_string())?;
-    }
+    teardown_custom_entry(&app, &id)?;
     app.state::<CustomShortcuts>().0.lock().unwrap().retain(|sc| sc.id != id);
     persist_custom_shortcuts(&app)?;
     update_tray(&app);
@@ -1161,10 +1336,7 @@ fn set_user_messenger_preload(app: AppHandle, id: String, enable: bool) -> Resul
 
 #[tauri::command]
 fn remove_user_messenger(app: AppHandle, id: String) -> Result<(), String> {
-    let label = custom_webview_label(&id);
-    if let Some(webview) = app.get_webview(&label) {
-        webview.close().map_err(|e| e.to_string())?;
-    }
+    teardown_custom_entry(&app, &id)?;
     app.state::<UserMessengers>().0.lock().unwrap().retain(|m| m.id != id);
     persist_user_messengers(&app)?;
     update_tray(&app);
@@ -1265,8 +1437,7 @@ async fn ensure_custom_webview(
         let _ = webview.set_size(size);
         webview.show().map_err(|e| e.to_string())?;
         webview.set_focus().map_err(|e| e.to_string())?;
-        *app.state::<ActiveMessenger>().0.lock().unwrap() = label.clone();
-        let _ = app.emit("active-messenger-changed", label.clone());
+        set_active_messenger(&app, label.clone());
         return Ok(format!("Focused existing {}", label));
     }
 
@@ -1331,8 +1502,7 @@ async fn ensure_custom_webview(
         return Ok(format!("Preloaded {}", label));
     }
 
-    *app.state::<ActiveMessenger>().0.lock().unwrap() = label.clone();
-    let _ = app.emit("active-messenger-changed", label.clone());
+    set_active_messenger(&app, label.clone());
     Ok(format!("Created {}", label))
 }
 
@@ -1370,6 +1540,12 @@ fn hide_all_messengers(app: &AppHandle) {
     }
 }
 
+fn do_hide_window(app: &AppHandle) {
+    if let Some(window) = app.get_window("main") {
+        let _ = window.hide();
+    }
+}
+
 fn do_show_window(app: &AppHandle) {
     let Some(window) = app.get_window("main") else { return };
     let _ = window.show();
@@ -1399,7 +1575,7 @@ fn toggle_window(app: &AppHandle) {
     let visible = window.is_visible().unwrap_or(false);
     let focused = window.is_focused().unwrap_or(false);
     if visible && focused {
-        let _ = window.hide();
+        do_hide_window(app);
     } else if visible {
         let _ = window.set_focus();
     } else {
@@ -1439,7 +1615,7 @@ fn set_silence_mode(app: AppHandle, state: State<SilenceMode>, enable: bool) -> 
         if *v == enable { return Ok(()); }
         *v = enable;
     }
-    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
     store.set("silence_mode", enable);
     store.save().map_err(|e| e.to_string())?;
     Ok(())
@@ -1460,15 +1636,17 @@ fn set_global_shortcut(
     if !old.is_empty() {
         let _ = app.global_shortcut().unregister(old.as_str());
     }
-    app.global_shortcut()
-        .on_shortcut(shortcut.as_str(), |handle, _, event| {
-            if event.state() == ShortcutState::Pressed {
-                toggle_window(handle);
-            }
-        })
-        .map_err(|e| e.to_string())?;
+    if let Err(error) = register_toggle_shortcut(&app, &shortcut) {
+        // The old accelerator is already unregistered at this point. Without
+        // putting it back, rejecting a new combination would also kill the
+        // working one, while the settings panel and the tray kept advertising it.
+        if !old.is_empty() {
+            let _ = register_toggle_shortcut(&app, &old);
+        }
+        return Err(error.to_string());
+    }
     *state.0.lock().unwrap() = shortcut.clone();
-    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
     store.set("hotkey", serde_json::Value::String(shortcut));
     store.save().map_err(|e| e.to_string())?;
     update_tray(&app);
@@ -1711,15 +1889,19 @@ pub fn run() {
                 log::warn!("Vibrancy unavailable: {}", e);
             }
 
-            window.on_window_event(move |event| {
-                if let WindowEvent::Resized(_) = event {
-                    reposition_webviews(&resize_handle);
+            window.on_window_event(move |event| match event {
+                WindowEvent::Resized(_) => reposition_webviews(&resize_handle),
+                // `ExitRequested` keeps the process alive, so destroying the
+                // window would strand it: every caller bails on a missing
+                // `main`, leaving tray and hotkey as no-ops until a relaunch.
+                WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    do_hide_window(&resize_handle);
                 }
+                _ => {}
             });
 
-            let store = app.handle().store("settings.json")
-                .map_err(|e| { log::error!("Failed to open settings store: {}", e); e })
-                .expect("Failed to open settings store");
+            let store = open_settings_store(app.handle())?;
             let saved_hotkey = store
                 .get("hotkey")
                 .and_then(|v| v.as_str().map(|s| s.to_string()))

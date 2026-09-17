@@ -215,6 +215,12 @@ interface DownloadStatusPayload {
   status: DownloadStatus;
 }
 
+// Backstop for an entry that never reaches a terminal status: the backend
+// sweeps downloads whose webview closed, but a WebKit delegate that dies
+// without reporting at all would leave one stuck on "downloading" forever, and
+// the indicator prefers active entries.
+const DOWNLOAD_STALE_MS = 30 * 60 * 1000;
+
 const downloadActivity = ref<DownloadStatusPayload[]>([]);
 const downloadCleanupTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
@@ -230,7 +236,9 @@ const downloadIndicator = computed(() => {
     };
   }
 
-  const latest = downloadActivity.value[downloadActivity.value.length - 1];
+  // Falls through to the most recent terminal result, so a stale active entry
+  // can no longer swallow the confirmation of a download that did finish.
+  const latest = downloadActivity.value.findLast(item => item.status !== "downloading");
   if (!latest) return null;
   return {
     status: latest.status,
@@ -243,23 +251,21 @@ const downloadIndicator = computed(() => {
 
 function handleDownloadStatus(payload: DownloadStatusPayload) {
   const existing = downloadActivity.value.findIndex(item => item.id === payload.id);
-  if (existing === -1) {
-    downloadActivity.value.push(payload);
-  } else {
-    downloadActivity.value.splice(existing, 1);
-    downloadActivity.value.push(payload);
-  }
+  if (existing !== -1) downloadActivity.value.splice(existing, 1);
+  downloadActivity.value.push(payload);
 
   const previousTimer = downloadCleanupTimers.get(payload.id);
   if (previousTimer) clearTimeout(previousTimer);
 
-  if (payload.status !== "downloading") {
-    const timer = setTimeout(() => {
-      downloadActivity.value = downloadActivity.value.filter(item => item.id !== payload.id);
-      downloadCleanupTimers.delete(payload.id);
-    }, payload.status === "failed" ? 10_000 : 6_000);
-    downloadCleanupTimers.set(payload.id, timer);
-  }
+  // One map owns every entry's lifetime, including the stale-active backstop.
+  const ttl = payload.status === "downloading"
+    ? DOWNLOAD_STALE_MS
+    : payload.status === "failed" ? 10_000 : 6_000;
+  const timer = setTimeout(() => {
+    downloadActivity.value = downloadActivity.value.filter(item => item.id !== payload.id);
+    downloadCleanupTimers.delete(payload.id);
+  }, ttl);
+  downloadCleanupTimers.set(payload.id, timer);
 }
 
 function shortcutInitial(name: string): string {
@@ -286,11 +292,20 @@ function formatHotkeyDisplay(hotkey: string): string {
     .join("");
 }
 
+// `{ once: true }` is re-armed on every bare modifier, so nothing removed the
+// listener when the user simply walked away from recording: the next keystroke
+// with a modifier — anywhere in the sidebar — was swallowed and silently
+// rebound the global hotkey. Recording now always unwinds through stopRecordingHotkey().
+function stopRecordingHotkey() {
+  isRecordingHotkey.value = false;
+  window.removeEventListener("keydown", captureHotkey);
+}
+
 function captureHotkey(e: KeyboardEvent) {
   e.preventDefault();
   e.stopPropagation();
   if (e.key === "Escape") {
-    isRecordingHotkey.value = false;
+    stopRecordingHotkey();
     return;
   }
   const mods: string[] = [];
@@ -299,21 +314,22 @@ function captureHotkey(e: KeyboardEvent) {
   if (e.altKey) mods.push("Alt");
   if (e.shiftKey) mods.push("Shift");
   if (["Meta", "Control", "Alt", "Shift"].includes(e.key)) {
-    window.addEventListener("keydown", captureHotkey, { once: true });
     return;
   }
   if (mods.length === 0) {
-    isRecordingHotkey.value = false;
+    stopRecordingHotkey();
     return;
   }
   const key = e.key === " " ? "Space" : e.key.length === 1 ? e.key.toUpperCase() : e.key;
+  stopRecordingHotkey();
   saveHotkey([...mods, key].join("+"));
 }
 
 function startRecordingHotkey() {
+  if (isRecordingHotkey.value) return;
   isRecordingHotkey.value = true;
   hotkeyError.value = "";
-  window.addEventListener("keydown", captureHotkey, { once: true });
+  window.addEventListener("keydown", captureHotkey);
 }
 
 async function installUpdate() {
@@ -793,6 +809,7 @@ onUnmounted(() => {
   unlisteners.forEach(fn => fn());
   downloadCleanupTimers.forEach(timer => clearTimeout(timer));
   downloadCleanupTimers.clear();
+  stopRecordingHotkey();
   document.removeEventListener("click", onDocumentClick);
 });
 

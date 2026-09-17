@@ -49,11 +49,11 @@
   (function patchWindowOpen() {
     const _open = window.open.bind(window);
     window.open = function (url, target, features) {
-      if (typeof url === 'string' && /^https?:\/\//i.test(url)) {
+      if (typeof url === 'string') {
         try {
-          const parsed = new URL(url);
+          const parsed = new URL(url, location.href);
           if (isExternalUrl(parsed)) {
-            sendOpenInBrowser(url);
+            sendOpenInBrowser(parsed.href);
             return null;
           }
         } catch (_) {}
@@ -70,22 +70,30 @@
       'click',
       function (e) {
         if (e.defaultPrevented || e.button !== 0) return;
+        // HTMLAnchorElement already exposes protocol/hostname/origin, so it
+        // satisfies isExternalUrl() directly — no URL allocation per click.
         const anchor = e.target && e.target.closest && e.target.closest('a[href]');
-        if (!anchor) return;
-        let parsed;
-        try {
-          parsed = new URL(anchor.href, location.href);
-        } catch (_) {
-          return;
-        }
-        if (!isExternalUrl(parsed)) return;
+        if (!anchor || !isExternalUrl(anchor)) return;
         e.preventDefault();
         e.stopPropagation();
-        sendOpenInBrowser(parsed.href);
+        sendOpenInBrowser(anchor.href);
       },
       true,
     );
   })();
+
+  // Retries after a failed send by undoing the optimistic `lastCount` update,
+  // so the next safety-net tick re-reads and re-sends the current count.
+  // Bounded: a permanent failure (denied ACL, wrong capability label) would
+  // otherwise turn every 5s tick into a full DOM scan plus a failing invoke,
+  // forever. The boot race this exists for clears in a tick or two.
+  const MAX_SEND_RETRIES = 5;
+  let _failedSends = 0;
+
+  function failSend() {
+    if (++_failedSends > MAX_SEND_RETRIES) return;
+    lastCount = -1;
+  }
 
   function tryFlush() {
     const invoke = resolveInvoke();
@@ -97,12 +105,19 @@
       const p = invoke('update_unread_count', { messenger: MESSENGER, count: c });
       if (p && typeof p.then === 'function') {
         p.then(
-          function () {},
-          function (e) { console.error('[Signalist Inject] invoke FAILED for', MESSENGER, e); }
+          function () { _failedSends = 0; },
+          function (e) {
+            // checkAndUpdate() already recorded `c` as sent and the 5s safety
+            // net short-circuits on count === lastCount, so without this the
+            // badge would stay pinned at its last successful value.
+            console.error('[Signalist Inject] invoke FAILED for', MESSENGER, e);
+            failSend();
+          }
         );
       }
     } catch (e) {
       console.error('[Signalist Inject] Tauri invoke threw:', e);
+      failSend();
     }
     return true;
   }

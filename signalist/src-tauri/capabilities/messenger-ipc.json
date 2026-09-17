@@ -12,8 +12,8 @@
       "https://*/*"
     ]
   },
+  "_comment": "No core:default here: it pulls in core:event:default (listen/emit), and with remote.urls covering https://*/* that would hand every embedded third-party page the app's event bus — enough to listen in on unread activity and download filenames, and to emit forged shortcut-added / confirm-delete-approved events at the sidebar. The inject scripts only ever call __TAURI_INTERNALS__.invoke, so the three command permissions below are all they need.",
   "permissions": [
-    "core:default",
     "allow-update-unread-count",
     "allow-update-sidebar-theme",
     "allow-open-in-browser"

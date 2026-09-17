@@ -26,22 +26,34 @@
     return null;
   }
 
+  // Hosts that belong to WhatsApp itself — navigation to these stays inside the webview.
+  const INTERNAL_HOST_RE = /(^|\.)(whatsapp\.com|whatsapp\.net)$/i;
+
+  function isExternalUrl(parsed) {
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    if (INTERNAL_HOST_RE.test(parsed.hostname)) return false;
+    return parsed.origin !== location.origin;
+  }
+
+  function sendOpenInBrowser(url) {
+    (function tryInvoke() {
+      const invoke = resolveInvoke();
+      if (invoke) {
+        invoke('open_in_browser', { url: url }).catch(() => {});
+      } else {
+        setTimeout(tryInvoke, 100);
+      }
+    })();
+  }
+
   (function patchWindowOpen() {
     const _open = window.open.bind(window);
     window.open = function (url, target, features) {
-      if (typeof url === 'string' && /^https?:\/\//i.test(url)) {
+      if (typeof url === 'string') {
         try {
-          const parsed = new URL(url);
-          if (parsed.origin !== location.origin) {
-            function tryInvoke() {
-              const invoke = resolveInvoke();
-              if (invoke) {
-                invoke('open_in_browser', { url: url }).catch(() => {});
-              } else {
-                setTimeout(tryInvoke, 100);
-              }
-            }
-            tryInvoke();
+          const parsed = new URL(url, location.href);
+          if (isExternalUrl(parsed)) {
+            sendOpenInBrowser(parsed.href);
             return null;
           }
         } catch (_) {}
@@ -49,6 +61,39 @@
       return _open(url, target, features);
     };
   })();
+
+  // WKWebView does not open `<a target="_blank">` links (no `window.open` call,
+  // no in-frame navigation to hit on_navigation), so external links silently do
+  // nothing. WhatsApp renders every link in a message that way.
+  (function patchLinkClicks() {
+    document.addEventListener(
+      'click',
+      function (e) {
+        if (e.defaultPrevented || e.button !== 0) return;
+        // HTMLAnchorElement already exposes protocol/hostname/origin, so it
+        // satisfies isExternalUrl() directly — no URL allocation per click.
+        const anchor = e.target && e.target.closest && e.target.closest('a[href]');
+        if (!anchor || !isExternalUrl(anchor)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        sendOpenInBrowser(anchor.href);
+      },
+      true,
+    );
+  })();
+
+  // Retries after a failed send by undoing the optimistic `lastCount` update,
+  // so the next safety-net tick re-reads and re-sends the current count.
+  // Bounded: a permanent failure (denied ACL, wrong capability label) would
+  // otherwise turn every 5s tick into a full DOM scan plus a failing invoke,
+  // forever. The boot race this exists for clears in a tick or two.
+  const MAX_SEND_RETRIES = 5;
+  let _failedSends = 0;
+
+  function failSend() {
+    if (++_failedSends > MAX_SEND_RETRIES) return;
+    lastCount = -1;
+  }
 
   function tryFlush() {
     const invoke = resolveInvoke();
@@ -60,12 +105,19 @@
       const p = invoke('update_unread_count', { messenger: MESSENGER, count: c });
       if (p && typeof p.then === 'function') {
         p.then(
-          function () {},
-          function (e) { console.error('[Signalist Inject] invoke FAILED for', MESSENGER, e); }
+          function () { _failedSends = 0; },
+          function (e) {
+            // checkAndUpdate() already recorded `c` as sent and the 5s safety
+            // net short-circuits on count === lastCount, so without this the
+            // badge would stay pinned at its last successful value.
+            console.error('[Signalist Inject] invoke FAILED for', MESSENGER, e);
+            failSend();
+          }
         );
       }
     } catch (e) {
       console.error('[Signalist Inject] Tauri invoke threw:', e);
+      failSend();
     }
     return true;
   }
