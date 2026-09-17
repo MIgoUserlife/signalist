@@ -503,6 +503,19 @@ fn shortcut_id_to_data_store_id(shortcut_id: &str) -> [u8; 16] {
     result
 }
 
+/// Where WebKit keeps the identifier-keyed data stores of this bundle id.
+///
+/// The dev build runs under `com.signalist.app.dev`, so it addresses its own
+/// directory and can never reach the release build's sessions.
+fn website_data_store_dir(app: &AppHandle) -> Option<PathBuf> {
+    let home = app.path().home_dir().ok()?;
+    Some(
+        home.join("Library/WebKit")
+            .join(&app.config().identifier)
+            .join("WebsiteDataStore"),
+    )
+}
+
 /// Formats a data-store UUID the way WebKit names its on-disk directory.
 fn data_store_dir_name(id: [u8; 16]) -> String {
     let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
@@ -537,20 +550,138 @@ fn teardown_custom_entry(app: &AppHandle, id: &str) -> Result<(), String> {
 /// authenticated session on disk with no UI able to reach it.
 fn purge_shortcut_data_store(app: &AppHandle, shortcut_id: &str) {
     let dir_name = data_store_dir_name(shortcut_id_to_data_store_id(shortcut_id));
-    let Ok(home) = app.path().home_dir() else {
+    let Some(root) = website_data_store_dir(app) else {
         return;
     };
-    let path = home
-        .join("Library/WebKit")
-        .join(&app.config().identifier)
-        .join("WebsiteDataStore")
-        .join(&dir_name);
+    let path = root.join(&dir_name);
     match std::fs::remove_dir_all(&path) {
         Ok(()) => {}
         // Not an error the user can act on, but worth seeing: it also means
         // WebKit moved this directory and the session was *not* erased.
         Err(e) => log::warn!("Data store {} was not removed: {}", dir_name, e),
     }
+}
+
+/// True for a name WebKit could only have gotten from `data_store_dir_name`:
+/// a canonical lowercase UUID, `8-4-4-4-12` hex digits.
+///
+/// The gate on the whole sweep. Anything else in that directory was put there
+/// by something this app does not know about, and guessing is not worth ~2 GB.
+fn is_data_store_dir_name(name: &str) -> bool {
+    let mut parts = name.split('-');
+    for len in [8, 4, 4, 4, 12] {
+        match parts.next() {
+            Some(part)
+                if part.len() == len
+                    && part.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) => {}
+            _ => return false,
+        }
+    }
+    parts.next().is_none()
+}
+
+/// Bytes held by a directory tree. Symlinks count as zero and are not followed.
+fn dir_size(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&entry.path()),
+            Ok(t) if t.is_file() => entry.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Erases data stores that no longer belong to any shortcut or messenger.
+///
+/// `purge_shortcut_data_store` only works forward: every shortcut deleted before
+/// it existed left its session — the cookies and local storage of a site the
+/// user had signed in to — on disk, unreachable from the UI and untouched by an
+/// upgrade. On the machine this was written for that was 16 directories and
+/// ~2.4 GB. The sweep also covers any directory the forward purge failed to
+/// remove, so a silently broken purge cannot accumulate sessions forever.
+///
+/// Runs on its own thread: `remove_dir_all` over gigabytes would otherwise hold
+/// up `setup` and, with it, the window.
+fn spawn_orphan_data_store_cleanup(app: AppHandle, store_trusted: bool) {
+    // Without a real shortcut list every store on disk looks orphaned, and the
+    // sweep would delete the sessions of shortcuts that are still in the
+    // sidebar. Leaving the orphans for the next launch is the cheaper mistake.
+    if !store_trusted {
+        log::warn!("Skipping the orphan data-store sweep: settings were not read from an existing, valid store");
+        return;
+    }
+    std::thread::spawn(move || {
+        let Some(root) = website_data_store_dir(&app) else {
+            return;
+        };
+
+        let mut keep: HashSet<String> = MESSENGERS
+            .iter()
+            .map(|m| data_store_dir_name(m.data_store_id))
+            .collect();
+        let mut custom_ids: Vec<String> = app
+            .state::<CustomShortcuts>()
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        custom_ids.extend(
+            app.state::<UserMessengers>()
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|m| m.id.clone()),
+        );
+        keep.extend(
+            custom_ids
+                .iter()
+                .map(|id| data_store_dir_name(shortcut_id_to_data_store_id(id))),
+        );
+
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            // Absent on a first run, before any webview has been created.
+            Err(e) => {
+                log::info!("No data stores to sweep in {}: {}", root.display(), e);
+                return;
+            }
+        };
+
+        let (mut removed, mut freed) = (0u32, 0u64);
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if keep.contains(&name) {
+                continue;
+            }
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) || !is_data_store_dir_name(&name) {
+                log::info!("Leaving unrecognised entry in WebsiteDataStore: {}", name);
+                continue;
+            }
+            let path = entry.path();
+            let size = dir_size(&path);
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    removed += 1;
+                    freed += size;
+                }
+                Err(e) => log::warn!("Orphan data store {} was not removed: {}", name, e),
+            }
+        }
+        if removed > 0 {
+            log::info!(
+                "Removed {} orphan data store(s), freeing {} MB",
+                removed,
+                freed / 1_048_576
+            );
+        }
+    });
 }
 
 /// Rejects ids that would not survive being interpolated into a webview URL.
@@ -578,11 +709,21 @@ fn generate_shortcut_id() -> String {
 /// into an app that crashed before creating its window on every subsequent
 /// launch, with no way back short of deleting the file by hand in
 /// `~/Library/Application Support`.
+///
+/// The returned flag is false when the settings on this run do not describe the
+/// user's actual configuration — the file was missing, or had to be moved
+/// aside. `spawn_orphan_data_store_cleanup` needs to know: an empty shortcut
+/// list is indistinguishable from "every session on disk is an orphan".
 fn open_settings_store(
     app: &AppHandle,
-) -> Result<std::sync::Arc<tauri_plugin_store::Store<tauri::Wry>>, Box<dyn std::error::Error>> {
+) -> Result<(std::sync::Arc<tauri_plugin_store::Store<tauri::Wry>>, bool), Box<dyn std::error::Error>> {
+    let existed = app
+        .path()
+        .app_config_dir()
+        .map(|dir| dir.join(SETTINGS_STORE).exists())
+        .unwrap_or(false);
     if let Ok(store) = app.store(SETTINGS_STORE) {
-        return Ok(store);
+        return Ok((store, existed));
     }
     log::error!("Settings store is unreadable; moving it aside and starting from defaults");
     if let Ok(dir) = app.path().app_config_dir() {
@@ -593,7 +734,7 @@ fn open_settings_store(
             }
         }
     }
-    Ok(app.store(SETTINGS_STORE)?)
+    Ok((app.store(SETTINGS_STORE)?, false))
 }
 
 fn persist_custom_shortcuts(app: &AppHandle) -> Result<(), String> {
@@ -1901,7 +2042,7 @@ pub fn run() {
                 _ => {}
             });
 
-            let store = open_settings_store(app.handle())?;
+            let (store, store_trusted) = open_settings_store(app.handle())?;
             let saved_hotkey = store
                 .get("hotkey")
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -1931,6 +2072,9 @@ pub fn run() {
 
             // After the store is loaded, so the preload set reflects saved flags.
             spawn_startup_preload(handle.clone());
+
+            // After the shortcut lists are in state, so the sweep knows what to keep.
+            spawn_orphan_data_store_cleanup(handle.clone(), store_trusted);
 
             app.handle()
                 .global_shortcut()
