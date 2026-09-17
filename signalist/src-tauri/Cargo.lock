@@ -3843,7 +3843,11 @@ dependencies = [
 name = "signalist"
 version = "0.5.5"
 dependencies = [
+ "block2 0.6.2",
  "log",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+ "objc2-web-kit",
  "serde",
  "serde_json",
  "tauri",

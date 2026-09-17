@@ -605,26 +605,152 @@ fn shortcut_id_to_data_store_id(shortcut_id: &str) -> [u8; 16] {
     result
 }
 
-/// Where WebKit keeps the identifier-keyed data stores of this bundle id.
+/// Formats a data-store UUID the canonical way, for log lines only.
 ///
-/// The dev build runs under `com.signalist.app.dev`, so it addresses its own
-/// directory and can never reach the release build's sessions.
-fn website_data_store_dir(app: &AppHandle) -> Option<PathBuf> {
-    let home = app.path().home_dir().ok()?;
-    Some(
-        home.join("Library/WebKit")
-            .join(&app.config().identifier)
-            .join("WebsiteDataStore"),
-    )
-}
-
-/// Formats a data-store UUID the way WebKit names its on-disk directory.
-fn data_store_dir_name(id: [u8; 16]) -> String {
+/// Nothing derives a path from this — WebKit owns where the store lives. It is
+/// the identifier the user would see in a `WKWebsiteDataStore` dump, and the
+/// only readable handle a warning about a failed removal can carry.
+fn format_data_store_id(id: [u8; 16]) -> String {
     let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
     format!(
         "{}-{}-{}-{}-{}",
         &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]
     )
+}
+
+/// How long to wait for one `WKWebsiteDataStore` operation to call back.
+///
+/// The work is a directory tree removal inside WebKit, so it is not instant on
+/// a store holding gigabytes of cache; it is still far below the ceiling here.
+/// A timeout is not a failure of the removal — WebKit may well finish after it
+/// — it only means this call stops waiting for the answer.
+const DATA_STORE_OP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Retries for a removal WebKit actively refused.
+///
+/// `removeDataStoreForIdentifier:` requires that every `WKWebView` using the
+/// store be released first. `Webview::close` only schedules that release, so a
+/// removal issued right after it can land while WebKit still holds the store.
+/// Waiting out one deallocation is what these attempts are for.
+const DATA_STORE_REMOVE_ATTEMPTS: u32 = 3;
+const DATA_STORE_REMOVE_RETRY_DELAY: Duration = Duration::from_millis(400);
+
+/// Why a `WKWebsiteDataStore` operation did not produce an answer.
+///
+/// The distinction matters: `Failed` is WebKit saying no, which a later attempt
+/// can still turn into a yes, while `TimedOut` means the answer never arrived
+/// and repeating the call would only stack more work on the main thread.
+enum DataStoreError {
+    Failed(String),
+    TimedOut,
+}
+
+impl std::fmt::Display for DataStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataStoreError::Failed(message) => write!(f, "{message}"),
+            DataStoreError::TimedOut => write!(
+                f,
+                "WebKit did not answer within {}s (it may still finish)",
+                DATA_STORE_OP_TIMEOUT.as_secs()
+            ),
+        }
+    }
+}
+
+/// Asks WebKit to delete one identifier-keyed data store.
+///
+/// The `+[WKWebsiteDataStore removeDataStoreForIdentifier:completionHandler:]`
+/// family is macOS 14+, which `check_macos_version_or_exit` already guarantees,
+/// and it is main-thread only — hence the hop through `run_on_main_thread`.
+/// **Never call this from the main thread**: it blocks until the completion
+/// handler runs, and that handler is dispatched to the very thread it would be
+/// blocking. That is not a theoretical trap — a plain `#[tauri::command]` runs
+/// *on* the main thread (only `async` ones and `command(async)` do not), so the
+/// first version of this deadlocked the whole window for the full timeout on
+/// every shortcut deletion. Hence the thread in `purge_shortcut_data_store`;
+/// the sweep already had one.
+///
+/// A store that does not exist is not an error here: WebKit creates one only
+/// when the webview first loads, so a shortcut added and deleted without ever
+/// being opened has nothing to erase, and nothing to report.
+#[cfg(target_os = "macos")]
+fn remove_data_store(app: &AppHandle, id: [u8; 16]) -> Result<(), DataStoreError> {
+    use objc2_web_kit::WKWebsiteDataStore;
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let dispatched = app.run_on_main_thread(move || {
+        let Some(mtm) = objc2::MainThreadMarker::new() else {
+            let _ = tx.send(Err("not on the main thread".into()));
+            return;
+        };
+        let uuid = objc2_foundation::NSUUID::from_bytes(id);
+        let handler = block2::RcBlock::new(move |error: *mut objc2_foundation::NSError| {
+            let _ = tx.send(match unsafe { error.as_ref() } {
+                None => Ok(()),
+                Some(error) => Err(error.localizedDescription().to_string()),
+            });
+        });
+        unsafe {
+            WKWebsiteDataStore::removeDataStoreForIdentifier_completionHandler(&uuid, &handler, mtm)
+        };
+    });
+    if let Err(e) = dispatched {
+        return Err(DataStoreError::Failed(e.to_string()));
+    }
+    match rx.recv_timeout(DATA_STORE_OP_TIMEOUT) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => Err(DataStoreError::Failed(message)),
+        Err(_) => Err(DataStoreError::TimedOut),
+    }
+}
+
+/// `remove_data_store`, waiting out a webview WebKit has not released yet.
+#[cfg(target_os = "macos")]
+fn remove_data_store_retrying(app: &AppHandle, id: [u8; 16]) -> Result<(), DataStoreError> {
+    let mut last = DataStoreError::TimedOut;
+    for attempt in 0..DATA_STORE_REMOVE_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(DATA_STORE_REMOVE_RETRY_DELAY);
+        }
+        match remove_data_store(app, id) {
+            Ok(()) => return Ok(()),
+            // Nothing came back at all: repeating would only queue more work
+            // behind whatever is holding up the main thread.
+            Err(e @ DataStoreError::TimedOut) => return Err(e),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// Every persistent data store this bundle id owns, as WebKit accounts for it.
+///
+/// `+[WKWebsiteDataStore fetchAllDataStoreIdentifiers:]` lists only genuine
+/// identifier-keyed stores — the default and non-persistent ones have no
+/// identifier and never appear — so an entry here can be matched against the
+/// app's own identifiers with no guessing about what else might be on disk.
+#[cfg(target_os = "macos")]
+fn fetch_data_store_ids(app: &AppHandle) -> Result<Vec<[u8; 16]>, DataStoreError> {
+    use objc2_foundation::{NSArray, NSUUID};
+    use objc2_web_kit::WKWebsiteDataStore;
+
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<[u8; 16]>>();
+    let dispatched = app.run_on_main_thread(move || {
+        let Some(mtm) = objc2::MainThreadMarker::new() else {
+            return;
+        };
+        let handler = block2::RcBlock::new(move |ids: std::ptr::NonNull<NSArray<NSUUID>>| {
+            let ids = unsafe { ids.as_ref() };
+            let _ = tx.send(ids.iter().map(|uuid| uuid.as_bytes()).collect());
+        });
+        unsafe { WKWebsiteDataStore::fetchAllDataStoreIdentifiers(&handler, mtm) };
+    });
+    if let Err(e) = dispatched {
+        return Err(DataStoreError::Failed(e.to_string()));
+    }
+    rx.recv_timeout(DATA_STORE_OP_TIMEOUT)
+        .map_err(|_| DataStoreError::TimedOut)
 }
 
 /// Everything that has to happen when a shortcut or user messenger goes away:
@@ -641,70 +767,52 @@ fn data_store_dir_name(id: [u8; 16]) -> String {
 /// derives a canonical UUID from it — so an odd id is harmless.
 fn teardown_custom_entry(app: &AppHandle, id: &StoredId) -> Result<(), String> {
     let label = custom_webview_label(id.as_str());
-    if let Some(webview) = app.get_webview(&label) {
-        webview.close().map_err(|e| e.to_string())?;
-        purge_webview_downloads(app, &label);
+    match app.get_webview(&label) {
+        // The entry was open in this session, so a `WKWebView` exists for its
+        // store. `removeDataStoreForIdentifier:` requires that view to be
+        // released first, and nothing lets us observe that: `Webview::close`
+        // only takes the view out of Tauri's map, while the Obj-C object dies
+        // whenever WebKit gets round to it. Erasing the session is therefore
+        // left to the next launch's sweep, where no view can possibly hold the
+        // store — dropping the entry from the settings below is what makes it
+        // an orphan, so nothing extra has to be recorded. The cost is real and
+        // deliberate: the session survives on disk until the app restarts.
+        Some(webview) => {
+            webview.close().map_err(|e| e.to_string())?;
+            purge_webview_downloads(app, &label);
+        }
+        // Never opened here, so this process created no view for the store and
+        // the API's precondition holds by construction. Usually there is also
+        // nothing to erase — WebKit creates the store on the first load — but
+        // an entry carried over from an earlier run has a session worth wiping
+        // now rather than at the next start.
+        None => purge_shortcut_data_store(app, id.as_str()),
     }
-    purge_shortcut_data_store(app, id.as_str());
     Ok(())
 }
 
-/// Deletes the cookies and local storage of a removed shortcut or user messenger.
-///
-/// An identifier-keyed `WKWebsiteDataStore` lives in
-/// `~/Library/WebKit/<bundle id>/WebsiteDataStore/<uuid>`. Closing the webview
-/// leaves it untouched, so a user who signs in to a site, then deletes the
-/// shortcut to get that account off the machine, would otherwise keep an
-/// authenticated session on disk with no UI able to reach it.
+/// Deletes the cookies and local storage of a removed shortcut or user messenger
+/// that had no webview in this session — see `teardown_custom_entry` for why
+/// that is the only case this runs in.
+/// Runs on its own thread because the caller is on the main one. A plain
+/// `#[tauri::command]` — which both delete commands are — executes on the main
+/// thread, and `remove_data_store` blocks until WebKit answers *on that same
+/// thread*: waiting inline froze the window for the whole timeout and then
+/// reported a removal that had not even been dispatched yet.
 fn purge_shortcut_data_store(app: &AppHandle, shortcut_id: &str) {
-    let dir_name = data_store_dir_name(shortcut_id_to_data_store_id(shortcut_id));
-    let Some(root) = website_data_store_dir(app) else {
-        return;
-    };
-    let path = root.join(&dir_name);
-    match std::fs::remove_dir_all(&path) {
-        Ok(()) => {}
-        // WebKit only creates the directory when the webview first loads, so a
-        // shortcut that was added and deleted without ever being opened has
-        // nothing on disk. Nothing was leaked and nothing needs reporting.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        // Not an error the user can act on, but worth seeing: it also means
-        // WebKit moved this directory and the session was *not* erased.
-        Err(e) => log::warn!("Data store {} was not removed: {}", dir_name, e),
-    }
-}
-
-/// True for a name WebKit could only have gotten from `data_store_dir_name`:
-/// a canonical lowercase UUID, `8-4-4-4-12` hex digits.
-///
-/// The gate on the whole sweep. Anything else in that directory was put there
-/// by something this app does not know about, and guessing is not worth ~2 GB.
-fn is_data_store_dir_name(name: &str) -> bool {
-    let mut parts = name.split('-');
-    for len in [8, 4, 4, 4, 12] {
-        match parts.next() {
-            Some(part)
-                if part.len() == len
-                    && part.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) => {}
-            _ => return false,
+    let id = shortcut_id_to_data_store_id(shortcut_id);
+    let app = app.clone();
+    std::thread::spawn(move || {
+        // Not an error the user can act on, but worth seeing: it also means the
+        // session was *not* erased.
+        if let Err(e) = remove_data_store_retrying(&app, id) {
+            log::warn!(
+                "Data store {} was not removed: {}",
+                format_data_store_id(id),
+                e
+            );
         }
-    }
-    parts.next().is_none()
-}
-
-/// Bytes held by a directory tree. Symlinks count as zero and are not followed.
-fn dir_size(path: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|entry| match entry.file_type() {
-            Ok(t) if t.is_dir() => dir_size(&entry.path()),
-            Ok(t) if t.is_file() => entry.metadata().map(|m| m.len()).unwrap_or(0),
-            _ => 0,
-        })
-        .sum()
+    });
 }
 
 /// Erases data stores that no longer belong to any shortcut or messenger.
@@ -712,29 +820,22 @@ fn dir_size(path: &Path) -> u64 {
 /// `purge_shortcut_data_store` only works forward: every shortcut deleted before
 /// it existed left its session — the cookies and local storage of a site the
 /// user had signed in to — on disk, unreachable from the UI and untouched by an
-/// upgrade. On the machine this was written for that was 16 directories and
-/// ~2.4 GB. The sweep also covers any directory the forward purge failed to
-/// remove, so a silently broken purge cannot accumulate sessions forever.
+/// upgrade. On the machine this was written for that was 16 stores and ~2.4 GB.
+/// The sweep also covers any store the forward purge failed to remove, so a
+/// silently broken purge cannot accumulate sessions forever.
 ///
-/// Runs on its own thread: `remove_dir_all` over gigabytes would otherwise hold
-/// up `setup` and, with it, the window.
+/// Runs on its own thread: it blocks on WebKit's callbacks, and doing that in
+/// `setup` would hold up the main thread that has to deliver them.
 fn spawn_orphan_data_store_cleanup(app: AppHandle, store_trusted: bool) {
-    // Without a real shortcut list every store on disk looks orphaned, and the
-    // sweep would delete the sessions of shortcuts that are still in the
-    // sidebar. Leaving the orphans for the next launch is the cheaper mistake.
+    // Without a real shortcut list every store looks orphaned, and the sweep
+    // would delete the sessions of shortcuts that are still in the sidebar.
+    // Leaving the orphans for the next launch is the cheaper mistake.
     if !store_trusted {
         log::warn!("Skipping the orphan data-store sweep: settings were not read from an existing, valid store");
         return;
     }
     std::thread::spawn(move || {
-        let Some(root) = website_data_store_dir(&app) else {
-            return;
-        };
-
-        let mut keep: HashSet<String> = MESSENGERS
-            .iter()
-            .map(|m| data_store_dir_name(m.data_store_id))
-            .collect();
+        let mut keep: HashSet<[u8; 16]> = MESSENGERS.iter().map(|m| m.data_store_id).collect();
         let mut custom_ids: Vec<StoredId> = app
             .state::<CustomShortcuts>()
             .0
@@ -754,44 +855,33 @@ fn spawn_orphan_data_store_cleanup(app: AppHandle, store_trusted: bool) {
         keep.extend(
             custom_ids
                 .iter()
-                .map(|id| data_store_dir_name(shortcut_id_to_data_store_id(id.as_str()))),
+                .map(|id| shortcut_id_to_data_store_id(id.as_str())),
         );
 
-        let entries = match std::fs::read_dir(&root) {
-            Ok(entries) => entries,
-            // Absent on a first run, before any webview has been created.
+        let ids = match fetch_data_store_ids(&app) {
+            Ok(ids) => ids,
             Err(e) => {
-                log::info!("No data stores to sweep in {}: {}", root.display(), e);
+                log::warn!("Could not list data stores to sweep: {}", e);
                 return;
             }
         };
 
-        let (mut removed, mut freed) = (0u32, 0u64);
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if keep.contains(&name) {
+        let mut removed = 0u32;
+        for id in ids {
+            if keep.contains(&id) {
                 continue;
             }
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) || !is_data_store_dir_name(&name) {
-                log::info!("Leaving unrecognised entry in WebsiteDataStore: {}", name);
-                continue;
-            }
-            let path = entry.path();
-            let size = dir_size(&path);
-            match std::fs::remove_dir_all(&path) {
-                Ok(()) => {
-                    removed += 1;
-                    freed += size;
-                }
-                Err(e) => log::warn!("Orphan data store {} was not removed: {}", name, e),
+            match remove_data_store_retrying(&app, id) {
+                Ok(()) => removed += 1,
+                Err(e) => log::warn!(
+                    "Orphan data store {} was not removed: {}",
+                    format_data_store_id(id),
+                    e
+                ),
             }
         }
         if removed > 0 {
-            log::info!(
-                "Removed {} orphan data store(s), freeing {} MB",
-                removed,
-                freed / 1_048_576
-            );
+            log::info!("Removed {} orphan data store(s)", removed);
         }
     });
 }

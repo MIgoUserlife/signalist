@@ -32,3 +32,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 window-vibrancy = "0.5"
 
+# Deleting a shortcut's session is `+[WKWebsiteDataStore
+# removeDataStoreForIdentifier:completionHandler:]` (macOS 14+), so the app
+# never has to know where WebKit keeps its stores. wry already pulls these exact
+# versions in, so naming them here adds no crate to the build.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSUUID", "NSError", "NSString", "NSArray"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "WKWebsiteDataStore"] }
+block2 = "0.6"
+
