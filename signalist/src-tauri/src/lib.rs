@@ -202,12 +202,6 @@ fn unique_download_destination(path: &Path, reserved: &HashSet<PathBuf>) -> Path
     unreachable!("an available download filename must eventually be found")
 }
 
-/// Sends an internal event to the sidebar and nowhere else.
-///
-/// The only way internal events may be emitted. `Emitter::emit` is **not**
-/// scoped to the webview it is called on — it delegates to the app-wide
-/// manager, so a plain `emit` reaches every embedded remote page too. Keeping
-/// the target in one place makes "no bare `.emit(` in this file" greppable.
 fn register_toggle_shortcut(
     app: &AppHandle,
     accelerator: &str,
@@ -228,6 +222,12 @@ fn set_active_messenger(app: &AppHandle, label: String) {
     emit_to_sidebar(app, "active-messenger-changed", label);
 }
 
+/// Sends an internal event to the sidebar and nowhere else.
+///
+/// The only way internal events may be emitted. `Emitter::emit` is **not**
+/// scoped to the webview it is called on — it delegates to the app-wide
+/// manager, so a plain `emit` reaches every embedded remote page too. Keeping
+/// the target in one place makes "no bare `.emit(` in this file" greppable.
 fn emit_to_sidebar<R: Runtime, P: Serialize + Clone>(app: &AppHandle<R>, event: &str, payload: P) {
     let _ = app.emit_to(EventTarget::webview("sidebar"), event, payload);
 }
@@ -530,8 +530,16 @@ fn data_store_dir_name(id: [u8; 16]) -> String {
 ///
 /// Shared so the next teardown step only has to be written once — the two
 /// callers differ solely in which list they then drop the entry from.
+///
+/// Deliberately does **not** call `validate_shortcut_id`: removal must work for
+/// an entry whose id this build would not generate (a hand-edited
+/// `settings.json`, an id format predating `generate_shortcut_id`), otherwise
+/// the `×` button fails forever and the entry is undeletable from the UI.
+/// Nothing here interpolates the id into a path — `shortcut_id_to_data_store_id`
+/// derives a canonical UUID from it — so an odd id is harmless. Validation
+/// belongs on the URL-interpolating paths (`open_edit_shortcut_window`,
+/// `open_confirm_delete_window`), which still have it.
 fn teardown_custom_entry(app: &AppHandle, id: &str) -> Result<(), String> {
-    validate_shortcut_id(id)?;
     let label = custom_webview_label(id);
     if let Some(webview) = app.get_webview(&label) {
         webview.close().map_err(|e| e.to_string())?;
@@ -556,6 +564,10 @@ fn purge_shortcut_data_store(app: &AppHandle, shortcut_id: &str) {
     let path = root.join(&dir_name);
     match std::fs::remove_dir_all(&path) {
         Ok(()) => {}
+        // WebKit only creates the directory when the webview first loads, so a
+        // shortcut that was added and deleted without ever being opened has
+        // nothing on disk. Nothing was leaked and nothing needs reporting.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         // Not an error the user can act on, but worth seeing: it also means
         // WebKit moved this directory and the session was *not* erased.
         Err(e) => log::warn!("Data store {} was not removed: {}", dir_name, e),

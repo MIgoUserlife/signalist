@@ -19,9 +19,17 @@ MOUNT_DIR=""
 # Detach before deleting the work directory. Without this, an abort while the
 # image is attached sends `rm -rf` straight into the mounted read-write volume,
 # deleting the app bundle inside it before it fails on the mount point.
+# A failed detach is the case this guard exists for, not an edge case: the
+# osascript step opens the volume in Finder, which is the usual reason a mount
+# stays busy. Leaving the work directory behind on a runner that is discarded
+# minutes later costs nothing; deleting through a live mount destroys the app
+# bundle inside the image.
 cleanup() {
   if [ -n "$MOUNT_DIR" ] && [ -d "$MOUNT_DIR" ]; then
-    hdiutil detach "$MOUNT_DIR" -force -quiet 2>/dev/null || true
+    if ! hdiutil detach "$MOUNT_DIR" -force -quiet 2>/dev/null; then
+      echo "Could not detach $MOUNT_DIR; leaving $WORKDIR in place." >&2
+      return
+    fi
   fi
   rm -rf "$WORKDIR"
 }
