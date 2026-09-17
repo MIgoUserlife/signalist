@@ -171,16 +171,20 @@ struct PendingDownload {
     destination: PathBuf,
 }
 
-#[derive(Default)]
-struct DownloadTrackerInner {
-    pending: HashMap<(String, String), VecDeque<PendingDownload>>,
-    reserved_destinations: HashSet<PathBuf>,
-}
+/// Downloads still in flight, keyed by the webview that started them and the
+/// URL wry reports back.
+///
+/// It doubles as the reservation table: an entry's `destination` is taken until
+/// that entry is gone, so there is exactly one way to release a path — drop the
+/// record — and `purge_webview_downloads` reaches it by construction. A
+/// separate set of reserved paths had two independent removal sites, and that
+/// is how a path once stayed taken for the lifetime of the process.
+type PendingDownloads = HashMap<(String, String), VecDeque<PendingDownload>>;
 
 #[derive(Default)]
 pub struct DownloadTracker {
     next_id: AtomicU64,
-    inner: Mutex<DownloadTrackerInner>,
+    pending: Mutex<PendingDownloads>,
 }
 
 #[derive(Clone, Serialize)]
@@ -191,8 +195,16 @@ struct DownloadStatusPayload {
     status: &'static str,
 }
 
-fn unique_download_destination(path: &Path, reserved: &HashSet<PathBuf>) -> PathBuf {
-    if !path.exists() && !reserved.contains(path) {
+fn unique_download_destination(path: &Path, pending: &PendingDownloads) -> PathBuf {
+    let is_taken = |candidate: &Path| {
+        candidate.exists()
+            || pending
+                .values()
+                .flatten()
+                .any(|download| download.destination == candidate)
+    };
+
+    if !is_taken(path) {
         return path.to_path_buf();
     }
 
@@ -211,7 +223,7 @@ fn unique_download_destination(path: &Path, reserved: &HashSet<PathBuf>) -> Path
 
     for counter in 1.. {
         let candidate = parent.join(format!("{stem} ({counter}){extension}"));
-        if !candidate.exists() && !reserved.contains(&candidate) {
+        if !is_taken(&candidate) {
             return candidate;
         }
     }
@@ -257,18 +269,18 @@ fn emit_download_status<R: Runtime>(app: &AppHandle<R>, payload: DownloadStatusP
 ///
 /// Closing a webview destroys its wry download delegate, so neither
 /// `download_did_finish` nor `download_did_fail` ever fires for downloads that
-/// were still running. Without this sweep the reserved destinations would be
-/// held for the lifetime of the process (renaming every later download of the
-/// same name to `name (1)`) and the sidebar would keep showing "downloading"
-/// forever.
+/// were still running. Without this sweep their destinations would stay
+/// reserved for the lifetime of the process (renaming every later download of
+/// the same name to `name (1)`) and the sidebar would keep showing
+/// "downloading" forever.
 fn purge_webview_downloads<R: Runtime>(app: &AppHandle<R>, webview_label: &str) {
     let Some(tracker) = app.try_state::<DownloadTracker>() else {
         return;
     };
     let mut abandoned: Vec<PendingDownload> = Vec::new();
     {
-        let mut inner = tracker.inner.lock().unwrap();
-        inner.pending.retain(|(label, _), queue| {
+        let mut pending = tracker.pending.lock().unwrap();
+        pending.retain(|(label, _), queue| {
             if label == webview_label {
                 abandoned.extend(std::mem::take(queue));
                 false
@@ -276,9 +288,6 @@ fn purge_webview_downloads<R: Runtime>(app: &AppHandle<R>, webview_label: &str) 
                 true
             }
         });
-        for pending in &abandoned {
-            inner.reserved_destinations.remove(&pending.destination);
-        }
     }
 
     for pending in abandoned {
@@ -301,8 +310,8 @@ fn handle_download<R: Runtime>(webview: Webview<R>, event: DownloadEvent<'_>) ->
         DownloadEvent::Requested { url, destination } => {
             // Wry proposes the user's Downloads directory. Resolve collisions
             // again while downloads are in flight, before their files may exist.
-            let mut inner = tracker.inner.lock().unwrap();
-            *destination = unique_download_destination(destination, &inner.reserved_destinations);
+            let mut pending = tracker.pending.lock().unwrap();
+            *destination = unique_download_destination(destination, &pending);
             let file_name = destination
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -310,17 +319,12 @@ fn handle_download<R: Runtime>(webview: Webview<R>, event: DownloadEvent<'_>) ->
             let id = tracker.next_id.fetch_add(1, Ordering::Relaxed) + 1;
             let key = (webview_label, url.to_string());
 
-            inner.reserved_destinations.insert(destination.clone());
-            inner
-                .pending
-                .entry(key)
-                .or_default()
-                .push_back(PendingDownload {
-                    id,
-                    file_name: file_name.clone(),
-                    destination: destination.clone(),
-                });
-            drop(inner);
+            pending.entry(key).or_default().push_back(PendingDownload {
+                id,
+                file_name: file_name.clone(),
+                destination: destination.clone(),
+            });
+            drop(pending);
 
             emit_download_status(
                 webview.app_handle(),
@@ -334,28 +338,27 @@ fn handle_download<R: Runtime>(webview: Webview<R>, event: DownloadEvent<'_>) ->
         }
         DownloadEvent::Finished { url, success, .. } => {
             let key = (webview_label, url.to_string());
-            let mut inner = tracker.inner.lock().unwrap();
-            let pending = inner.pending.get_mut(&key).and_then(VecDeque::pop_front);
-            let remove_queue = inner.pending.get(&key).is_some_and(VecDeque::is_empty);
-            if remove_queue {
-                inner.pending.remove(&key);
+            let mut pending = tracker.pending.lock().unwrap();
+            // macOS never reports which file finished (`Finished.path` is always
+            // `None` there, and wry's completion callback carries nothing but
+            // the original request URL), so with several downloads of the same
+            // URL in flight the queue order is all we have and the popped entry
+            // may not be the one that just finished. Not fixable from here; the
+            // on-disk check in unique_download_destination is what keeps a
+            // misattributed release from overwriting anything.
+            let finished = pending.get_mut(&key).and_then(VecDeque::pop_front);
+            if pending.get(&key).is_some_and(VecDeque::is_empty) {
+                pending.remove(&key);
             }
 
-            if let Some(pending) = pending {
-                // macOS never reports which file finished (`Finished.path` is
-                // always `None` there), so with several downloads of the same
-                // URL in flight the queue order is all we have and the popped
-                // entry may not be the one that just finished. Unfixable from
-                // here; the on-disk check in unique_download_destination is
-                // what keeps a misattributed release from overwriting anything.
-                inner.reserved_destinations.remove(&pending.destination);
-                drop(inner);
+            if let Some(pending_download) = finished {
+                drop(pending);
                 let status = if success { "completed" } else { "failed" };
                 emit_download_status(
                     webview.app_handle(),
                     DownloadStatusPayload {
-                        id: pending.id,
-                        file_name: pending.file_name,
+                        id: pending_download.id,
+                        file_name: pending_download.file_name,
                         status,
                     },
                 );
