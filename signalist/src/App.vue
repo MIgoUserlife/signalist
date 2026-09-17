@@ -215,17 +215,36 @@ interface DownloadStatusPayload {
   status: DownloadStatus;
 }
 
+// `receivedAt` never crosses the IPC boundary: the backend emits a status the
+// moment it changes, so the arrival time on this side is the event time.
+interface DownloadEntry extends DownloadStatusPayload {
+  receivedAt: number;
+}
+
 // Backstop for an entry that never reaches a terminal status: the backend
 // sweeps downloads whose webview closed, but a WebKit delegate that dies
-// without reporting at all would leave one stuck on "downloading" forever, and
-// the indicator prefers active entries.
+// without reporting at all would leave one stuck on "downloading" forever.
 const DOWNLOAD_STALE_MS = 30 * 60 * 1000;
 
-const downloadActivity = ref<DownloadStatusPayload[]>([]);
+// The indicator prefers active entries, so a stuck one would swallow every
+// later confirmation for the full DOWNLOAD_STALE_MS above. It stops counting as
+// active much sooner than it is dropped. There is no progress event to tell a
+// dead delegate from a slow transfer — wry reports only Requested and Finished
+// — so this is a deliberate trade: a download running longer than this loses
+// its "downloading" indicator, while its terminal status still arrives.
+const DOWNLOAD_ACTIVE_STALE_MS = 5 * 60 * 1000;
+
+const downloadActivity = ref<DownloadEntry[]>([]);
 const downloadCleanupTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
 const downloadIndicator = computed(() => {
-  const active = downloadActivity.value.filter(item => item.status === "downloading");
+  // Recomputed on every change to downloadActivity, not on a clock: a stale
+  // entry is re-evaluated when the next download reports in or when its own
+  // cleanup timer drops it, which is exactly when the indicator can change.
+  const staleBefore = Date.now() - DOWNLOAD_ACTIVE_STALE_MS;
+  const active = downloadActivity.value.filter(
+    item => item.status === "downloading" && item.receivedAt > staleBefore,
+  );
   if (active.length > 0) {
     const latest = active[active.length - 1];
     const extra = active.length > 1 ? ` (+${active.length - 1})` : "";
@@ -236,8 +255,9 @@ const downloadIndicator = computed(() => {
     };
   }
 
-  // Falls through to the most recent terminal result, so a stale active entry
-  // can no longer swallow the confirmation of a download that did finish.
+  // Falls through to the most recent terminal result. The predicate matters
+  // here: a stale "downloading" entry stays in the array until its cleanup
+  // timer fires, and it may well be the last element.
   const latest = downloadActivity.value.findLast(item => item.status !== "downloading");
   if (!latest) return null;
   return {
@@ -252,7 +272,7 @@ const downloadIndicator = computed(() => {
 function handleDownloadStatus(payload: DownloadStatusPayload) {
   const existing = downloadActivity.value.findIndex(item => item.id === payload.id);
   if (existing !== -1) downloadActivity.value.splice(existing, 1);
-  downloadActivity.value.push(payload);
+  downloadActivity.value.push({ ...payload, receivedAt: Date.now() });
 
   const previousTimer = downloadCleanupTimers.get(payload.id);
   if (previousTimer) clearTimeout(previousTimer);
