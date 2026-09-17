@@ -368,9 +368,94 @@ fn handle_download<R: Runtime>(webview: Webview<R>, event: DownloadEvent<'_>) ->
     }
 }
 
+/// True for an id that survives being interpolated into a webview URL or a
+/// window label: `#` or `&` in one silently rewrites a dialog's query string,
+/// and a label outside this set no longer matches the `confirm-delete-*` glob
+/// in `capabilities/default.json`.
+fn is_safe_shortcut_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// An id already known to be safe to interpolate, because nothing else can
+/// construct one: the check lives in `Deserialize`, so a command that declares
+/// `ShortcutId` rejects a bad argument before its body runs. The invariant is
+/// carried by the type instead of by a validation call each new command has to
+/// remember.
+///
+/// Ids are generated as hex (`generate_shortcut_id`), so this only ever fires
+/// for a hand-edited or migrated `settings.json`. Such an entry must stay
+/// listable and removable, which is what `StoredId` is for.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct ShortcutId(String);
+
+impl ShortcutId {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ShortcutId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ShortcutId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        if !is_safe_shortcut_id(&raw) {
+            return Err(serde::de::Error::custom("Invalid id"));
+        }
+        Ok(Self(raw))
+    }
+}
+
+/// An id exactly as it sits in `settings.json`, with no shape assumed.
+///
+/// Stored entries deliberately do **not** use `ShortcutId`: one unparsable
+/// element fails the whole `custom_shortcuts` / `user_messengers` key, and
+/// `load_settings_list` then degrades to an empty list and drops the trust flag
+/// — every shortcut would vanish from the sidebar over one bad record. Skipping
+/// just the bad element is no better: it disappears from the UI, the next
+/// `persist_*` erases it from the file and the orphan sweep erases its session.
+///
+/// So a strange id is kept, and every path that makes an entry go away —
+/// `open_confirm_delete_window`, the two `remove_*` commands, `reorder_custom_shortcuts`
+/// — takes `StoredId` and stays reachable for it. Nothing derived from a
+/// `StoredId` may be interpolated raw into a URL or a label: `open_confirm_delete_window`
+/// percent-encodes it and names its window via `confirm_delete_label`, and the
+/// webview paths pass it through `shortcut_id_to_data_store_id`, which yields a
+/// canonical UUID rather than the id itself.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StoredId(String);
+
+impl StoredId {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for StoredId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<ShortcutId> for StoredId {
+    fn eq(&self, other: &ShortcutId) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl PartialEq<StoredId> for ShortcutId {
+    fn eq(&self, other: &StoredId) -> bool {
+        self.0 == other.0
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomShortcut {
-    pub id: String,
+    pub id: StoredId,
     pub name: String,
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -382,7 +467,7 @@ pub struct CustomShortcut {
 
 impl CustomShortcut {
     fn webview_label(&self) -> String {
-        custom_webview_label(&self.id)
+        custom_webview_label(self.id.as_str())
     }
 }
 
@@ -424,7 +509,7 @@ pub struct CustomShortcuts(pub Mutex<Vec<CustomShortcut>>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessenger {
-    pub id: String,
+    pub id: StoredId,
     pub name: String,
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -437,7 +522,7 @@ pub struct UserMessenger {
 
 impl UserMessenger {
     fn webview_label(&self) -> String {
-        custom_webview_label(&self.id)
+        custom_webview_label(self.id.as_str())
     }
 }
 
@@ -548,21 +633,19 @@ fn data_store_dir_name(id: [u8; 16]) -> String {
 /// Shared so the next teardown step only has to be written once — the two
 /// callers differ solely in which list they then drop the entry from.
 ///
-/// Deliberately does **not** call `validate_shortcut_id`: removal must work for
-/// an entry whose id this build would not generate (a hand-edited
+/// Takes a `StoredId` rather than a `ShortcutId` on purpose: removal must work
+/// for an entry whose id this build would not generate (a hand-edited
 /// `settings.json`, an id format predating `generate_shortcut_id`), otherwise
 /// the `×` button fails forever and the entry is undeletable from the UI.
 /// Nothing here interpolates the id into a path — `shortcut_id_to_data_store_id`
-/// derives a canonical UUID from it — so an odd id is harmless. Validation
-/// belongs on the URL-interpolating paths (`open_edit_shortcut_window`,
-/// `open_confirm_delete_window`), which still have it.
-fn teardown_custom_entry(app: &AppHandle, id: &str) -> Result<(), String> {
-    let label = custom_webview_label(id);
+/// derives a canonical UUID from it — so an odd id is harmless.
+fn teardown_custom_entry(app: &AppHandle, id: &StoredId) -> Result<(), String> {
+    let label = custom_webview_label(id.as_str());
     if let Some(webview) = app.get_webview(&label) {
         webview.close().map_err(|e| e.to_string())?;
         purge_webview_downloads(app, &label);
     }
-    purge_shortcut_data_store(app, id);
+    purge_shortcut_data_store(app, id.as_str());
     Ok(())
 }
 
@@ -652,7 +735,7 @@ fn spawn_orphan_data_store_cleanup(app: AppHandle, store_trusted: bool) {
             .iter()
             .map(|m| data_store_dir_name(m.data_store_id))
             .collect();
-        let mut custom_ids: Vec<String> = app
+        let mut custom_ids: Vec<StoredId> = app
             .state::<CustomShortcuts>()
             .0
             .lock()
@@ -671,7 +754,7 @@ fn spawn_orphan_data_store_cleanup(app: AppHandle, store_trusted: bool) {
         keep.extend(
             custom_ids
                 .iter()
-                .map(|id| data_store_dir_name(shortcut_id_to_data_store_id(id))),
+                .map(|id| data_store_dir_name(shortcut_id_to_data_store_id(id.as_str()))),
         );
 
         let entries = match std::fs::read_dir(&root) {
@@ -713,22 +796,50 @@ fn spawn_orphan_data_store_cleanup(app: AppHandle, store_trusted: bool) {
     });
 }
 
-/// Rejects ids that would not survive being interpolated into a webview URL.
+/// Percent-encodes a value going into a dialog's query string, keeping only the
+/// unreserved set. `URLSearchParams` in the dialog decodes it back.
 ///
-/// Ids are generated as hex, but a hand-edited or migrated `settings.json` can
-/// carry anything; a `#` or `&` in one silently rewrites the dialog's query
-/// string, and it then loads with the wrong — or an empty — target.
-fn validate_shortcut_id(id: &str) -> Result<(), String> {
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-        return Err("Invalid id".into());
+/// Needed because `open_confirm_delete_window` accepts a `StoredId`, which may
+/// be anything the settings file holds — a raw `#` or `&` there would rewrite
+/// the query string and the dialog would load with the wrong target.
+fn encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
     }
-    Ok(())
+    out
 }
 
-fn generate_shortcut_id() -> String {
+/// Window label for the confirmation prompt of `id`.
+///
+/// The label has to keep matching the `confirm-delete-*` glob in
+/// `capabilities/default.json`, so an id outside `is_safe_shortcut_id` is
+/// replaced by a hash of itself rather than refused — refusing would make that
+/// entry undeletable from the UI, which is the whole reason the delete path
+/// takes a `StoredId`. Two odd ids can collide here; the only consequence is
+/// that the second × focuses the prompt already open for the first.
+fn confirm_delete_label(id: &StoredId) -> String {
+    if is_safe_shortcut_id(id.as_str()) {
+        format!("confirm-delete-{}", id)
+    } else {
+        // FNV-1a, 64-bit: no dependency, and nothing here needs more than a
+        // stable name that is always label-safe.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in id.as_str().as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+        format!("confirm-delete-x{:016x}", hash)
+    }
+}
+
+fn generate_shortcut_id() -> StoredId {
     use std::time::{SystemTime, UNIX_EPOCH};
     let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    format!("{:08x}{:08x}", d.as_secs(), d.subsec_nanos())
+    StoredId(format!("{:08x}{:08x}", d.as_secs(), d.subsec_nanos()))
 }
 
 /// Opens `settings.json`, moving it aside if it cannot be parsed.
@@ -1333,8 +1444,7 @@ async fn open_add_shortcut_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn open_edit_shortcut_window(app: AppHandle, id: String) -> Result<(), String> {
-    validate_shortcut_id(&id)?;
+async fn open_edit_shortcut_window(app: AppHandle, id: ShortcutId) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("edit-shortcut") {
         let _ = win.set_focus();
         return Ok(());
@@ -1363,20 +1473,27 @@ async fn open_edit_shortcut_window(app: AppHandle, id: String) -> Result<(), Str
 ///
 /// The label carries the target id so a second × click, while an earlier prompt
 /// is still open, opens its own window instead of silently reusing one that
-/// names a different item. Capabilities match it via the `confirm-delete-*`
-/// glob, so the id is restricted to characters that are valid in a label.
+/// names a different item; `confirm_delete_label` keeps it matching the
+/// `confirm-delete-*` glob in the capabilities for any id.
+///
+/// This is the only way to reach the removal commands from the UI, so it takes
+/// a `StoredId` and accepts every id the settings file physically holds — see
+/// that type's doc comment.
 #[tauri::command]
-async fn open_confirm_delete_window(app: AppHandle, kind: String, id: String) -> Result<(), String> {
+async fn open_confirm_delete_window(app: AppHandle, kind: String, id: StoredId) -> Result<(), String> {
     if kind != "shortcut" && kind != "messenger" {
         return Err(format!("Unknown delete target kind: {}", kind));
     }
-    validate_shortcut_id(&id)?;
-    let label = format!("confirm-delete-{}", id);
+    let label = confirm_delete_label(&id);
     if let Some(win) = app.get_webview_window(&label) {
         let _ = win.set_focus();
         return Ok(());
     }
-    let url = format!("index.html?view=confirm-delete&kind={}&id={}", kind, id);
+    let url = format!(
+        "index.html?view=confirm-delete&kind={}&id={}",
+        kind,
+        encode_query_value(id.as_str())
+    );
     WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
         .title(if kind == "shortcut" { "Delete Shortcut" } else { "Delete Messenger" })
         .inner_size(380.0, 190.0)
@@ -1393,7 +1510,7 @@ async fn open_confirm_delete_window(app: AppHandle, kind: String, id: String) ->
 #[tauri::command]
 fn update_custom_shortcut(
     app: AppHandle,
-    id: String,
+    id: ShortcutId,
     name: String,
     url: String,
     icon: Option<String>,
@@ -1406,7 +1523,7 @@ fn update_custom_shortcut(
     }
     let color = normalize_color(color)?;
 
-    let label = custom_webview_label(&id);
+    let label = custom_webview_label(id.as_str());
     let (updated, url_changed) = {
         let state = app.state::<CustomShortcuts>();
         let mut shortcuts = state.0.lock().unwrap();
@@ -1458,7 +1575,7 @@ fn add_custom_shortcut(app: AppHandle, name: String, url: String, icon: Option<S
 /// and tray menu both render the vec as-is), so nothing but persistence and the
 /// tray needs refreshing — webviews keep their labels and data stores.
 #[tauri::command]
-fn reorder_custom_shortcuts(app: AppHandle, ids: Vec<String>) -> Result<Vec<CustomShortcut>, String> {
+fn reorder_custom_shortcuts(app: AppHandle, ids: Vec<StoredId>) -> Result<Vec<CustomShortcut>, String> {
     let reordered = {
         let state = app.state::<CustomShortcuts>();
         let mut shortcuts = state.0.lock().unwrap();
@@ -1486,7 +1603,7 @@ fn reorder_custom_shortcuts(app: AppHandle, ids: Vec<String>) -> Result<Vec<Cust
 }
 
 #[tauri::command]
-fn remove_custom_shortcut(app: AppHandle, id: String) -> Result<(), String> {
+fn remove_custom_shortcut(app: AppHandle, id: StoredId) -> Result<(), String> {
     teardown_custom_entry(&app, &id)?;
     app.state::<CustomShortcuts>().0.lock().unwrap().retain(|sc| sc.id != id);
     persist_custom_shortcuts(&app)?;
@@ -1547,7 +1664,7 @@ fn set_builtin_preload(app: AppHandle, messenger: String, enable: bool) -> Resul
 /// Takes effect on the next launch only — an already-created webview is left
 /// alone, and turning the flag on does not load the page mid-session.
 #[tauri::command]
-fn set_user_messenger_preload(app: AppHandle, id: String, enable: bool) -> Result<(), String> {
+fn set_user_messenger_preload(app: AppHandle, id: ShortcutId, enable: bool) -> Result<(), String> {
     {
         let state = app.state::<UserMessengers>();
         let mut list = state.0.lock().unwrap();
@@ -1561,7 +1678,7 @@ fn set_user_messenger_preload(app: AppHandle, id: String, enable: bool) -> Resul
 }
 
 #[tauri::command]
-fn remove_user_messenger(app: AppHandle, id: String) -> Result<(), String> {
+fn remove_user_messenger(app: AppHandle, id: StoredId) -> Result<(), String> {
     teardown_custom_entry(&app, &id)?;
     app.state::<UserMessengers>().0.lock().unwrap().retain(|m| m.id != id);
     persist_user_messengers(&app)?;
@@ -1634,7 +1751,7 @@ async fn open_bug_report_window(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 async fn open_custom_shortcut(
     app: AppHandle,
-    id: String,
+    id: StoredId,
     url: String,
 ) -> Result<String, String> {
     ensure_custom_webview(app, id, url, true).await
@@ -1645,11 +1762,11 @@ async fn open_custom_shortcut(
 /// switching to it later is instant, but it never steals the visible slot.
 async fn ensure_custom_webview(
     app: AppHandle,
-    id: String,
+    id: StoredId,
     url: String,
     activate: bool,
 ) -> Result<String, String> {
-    let label = custom_webview_label(&id);
+    let label = custom_webview_label(id.as_str());
 
     if let Some(webview) = app.get_webview(&label) {
         if !activate {
@@ -1672,7 +1789,7 @@ async fn ensure_custom_webview(
     if is_google_domain(&origin_host) {
         return Err("Google services are not supported in the embedded window. Please delete this shortcut and open the website in your browser.".into());
     }
-    let data_store_id = shortcut_id_to_data_store_id(&id);
+    let data_store_id = shortcut_id_to_data_store_id(id.as_str());
 
     let nav_guard = move |nav_url: &tauri::Url| -> bool {
         is_internal_frame_scheme(nav_url) || matches!(nav_url.scheme(), "https" | "http")
@@ -1898,7 +2015,7 @@ fn spawn_startup_preload(app: AppHandle) {
             .map(|m| m.label.to_string())
             .collect();
 
-        let user_targets: Vec<(String, String)> = app
+        let user_targets: Vec<(StoredId, String)> = app
             .try_state::<UserMessengers>()
             .map(|state| {
                 state.0.lock().unwrap()
