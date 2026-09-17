@@ -1,337 +1,62 @@
-(function () {
-  'use strict';
+// WhatsApp-specific half of the inject script. Concatenated after
+// `inject/common.js` inside one IIFE by `inject_script!` in lib.rs — everything
+// shared (IPC, fetch patch, external links, debounce, theme) lives there.
 
-  const MESSENGER = 'whatsapp';
-  const DEBOUNCE_MS = 300;
-  const MAX_DELAY_MS = 2000;
+function getDomCount() {
+  const container =
+    document.querySelector('#pane-side') ||
+    document.querySelector('#side') ||
+    document.querySelector('[aria-label="Chat list"]');
+  if (!container) return 0;
 
-  let _pendingCount = null;
-  let _pollTimer = null;
-  let _debounceTimer = null;
-  let _lastFireTime = Date.now();
-  let lastCount = -1;
+  const seen = new Set();
+  let total = 0;
+  const rows = container.querySelectorAll('[role="row"]');
 
-  function resolveInvoke() {
-    if (window.__TAURI_INTERNALS__ && typeof window.__TAURI_INTERNALS__.invoke === 'function') {
-      return window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__);
+  // Strategy 1: aria-label "N unread message(s)" on the row (English WhatsApp)
+  rows.forEach(row => {
+    const label = row.getAttribute('aria-label') || '';
+    const match = label.match(/(\d+)\s+unread message/i);
+    if (match) {
+      total += parseInt(match[1], 10);
     }
-    if (window.__TAURI__) {
-      if (window.__TAURI__.core && typeof window.__TAURI__.core.invoke === 'function') {
-        return window.__TAURI__.core.invoke.bind(window.__TAURI__.core);
-      }
-      if (typeof window.__TAURI__.invoke === 'function') {
-        return window.__TAURI__.invoke.bind(window.__TAURI__);
-      }
-    }
-    return null;
-  }
-
-  // Hosts that belong to WhatsApp itself — navigation to these stays inside the webview.
-  const INTERNAL_HOST_RE = /(^|\.)(whatsapp\.com|whatsapp\.net)$/i;
-
-  function isExternalUrl(parsed) {
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
-    if (INTERNAL_HOST_RE.test(parsed.hostname)) return false;
-    return parsed.origin !== location.origin;
-  }
-
-  function sendOpenInBrowser(url) {
-    (function tryInvoke() {
-      const invoke = resolveInvoke();
-      if (invoke) {
-        invoke('open_in_browser', { url: url }).catch(() => {});
-      } else {
-        setTimeout(tryInvoke, 100);
-      }
-    })();
-  }
-
-  (function patchWindowOpen() {
-    const _open = window.open.bind(window);
-    window.open = function (url, target, features) {
-      if (typeof url === 'string') {
-        try {
-          const parsed = new URL(url, location.href);
-          if (isExternalUrl(parsed)) {
-            sendOpenInBrowser(parsed.href);
-            return null;
-          }
-        } catch (_) {}
-      }
-      return _open(url, target, features);
-    };
-  })();
-
-  // WKWebView does not open `<a target="_blank">` links (no `window.open` call,
-  // no in-frame navigation to hit on_navigation), so external links silently do
-  // nothing. WhatsApp renders every link in a message that way.
-  (function patchLinkClicks() {
-    document.addEventListener(
-      'click',
-      function (e) {
-        if (e.defaultPrevented || e.button !== 0) return;
-        // HTMLAnchorElement already exposes protocol/hostname/origin, so it
-        // satisfies isExternalUrl() directly — no URL allocation per click.
-        const anchor = e.target && e.target.closest && e.target.closest('a[href]');
-        if (!anchor || !isExternalUrl(anchor)) return;
-        e.preventDefault();
-        e.stopPropagation();
-        sendOpenInBrowser(anchor.href);
-      },
-      true,
-    );
-  })();
-
-  // Retries after a failed send by undoing the optimistic `lastCount` update,
-  // so the next safety-net tick re-reads and re-sends the current count.
-  // Bounded: a permanent failure (denied ACL, wrong capability label) would
-  // otherwise turn every 5s tick into a full DOM scan plus a failing invoke,
-  // forever. The boot race this exists for clears in a tick or two.
-  const MAX_SEND_RETRIES = 5;
-  let _failedSends = 0;
-
-  function failSend() {
-    if (++_failedSends > MAX_SEND_RETRIES) return;
-    lastCount = -1;
-  }
-
-  function tryFlush() {
-    const invoke = resolveInvoke();
-    if (!invoke) return false;
-    if (_pendingCount === null) return true;
-    const c = _pendingCount;
-    _pendingCount = null;
-    try {
-      const p = invoke('update_unread_count', { messenger: MESSENGER, count: c });
-      if (p && typeof p.then === 'function') {
-        p.then(
-          function () { _failedSends = 0; },
-          function (e) {
-            // checkAndUpdate() already recorded `c` as sent and the 5s safety
-            // net short-circuits on count === lastCount, so without this the
-            // badge would stay pinned at its last successful value.
-            console.error('[Signalist Inject] invoke FAILED for', MESSENGER, e);
-            failSend();
-          }
-        );
-      }
-    } catch (e) {
-      console.error('[Signalist Inject] Tauri invoke threw:', e);
-      failSend();
-    }
-    return true;
-  }
-
-  function detectAndReportTheme() {
-    const invoke = resolveInvoke();
-    if (!invoke) return;
-    const bg = getComputedStyle(document.documentElement).backgroundColor;
-    const m = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-    if (!m) return;
-    const lum = (0.299 * +m[1] + 0.587 * +m[2] + 0.114 * +m[3]) / 255;
-    const p = invoke('update_sidebar_theme_from_webview', { isDark: lum < 0.5 });
-    if (p && typeof p.then === 'function') p.then(function(){}, function(){});
-  }
-
-  document.addEventListener('visibilitychange', function() {
-    if (!document.hidden) detectAndReportTheme();
   });
 
-  function invokeTauri(count) {
-    _pendingCount = count; // always overwrite — we only care about the latest value
-    if (tryFlush()) return;
-    // internals not ready yet — start polling
-    if (_pollTimer) return;
-    _pollTimer = setInterval(function () {
-      if (tryFlush()) {
-        clearInterval(_pollTimer);
-        _pollTimer = null;
-      }
-    }, 200);
-  }
+  if (total > 0) return total;
 
-  function getTitleCount() {
-    const match = document.title.match(/^\((\d+)\)/);
-    if (match) {
-      const num = parseInt(match[1], 10);
-      return isNaN(num) ? 0 : num;
+  // Strategy 2: visible digit-only badge spans inside chat rows (language-independent)
+  rows.forEach(row => {
+    for (const span of row.querySelectorAll('span')) {
+      const text = (span.textContent || '').trim();
+      if (!/^\d+$/.test(text)) continue;
+      const num = parseInt(text, 10);
+      if (num <= 0 || num > 9999) continue;
+      if (seen.has(span)) continue;
+      const rect = span.getBoundingClientRect();
+      if (rect.width < 1 || rect.height < 1 || rect.width > 60) continue;
+      seen.add(span);
+      total += num;
+      break; // one badge per row
     }
-    return 0;
-  }
+  });
 
-  function getDomCount() {
-    const container =
-      document.querySelector('#pane-side') ||
-      document.querySelector('#side') ||
-      document.querySelector('[aria-label="Chat list"]');
-    if (!container) return 0;
+  return total;
+}
 
-    const seen = new Set();
-    let total = 0;
-    const rows = container.querySelectorAll('[role="row"]');
+function getUnreadCount() {
+  // WhatsApp title shows chat count ("(3) WhatsApp"), not message count.
+  // getDomCount() sums aria-label "N unread messages" per row — the correct metric.
+  return getDomCount();
+}
 
-    // Strategy 1: aria-label "N unread message(s)" on the row (English WhatsApp)
-    rows.forEach(row => {
-      const label = row.getAttribute('aria-label') || '';
-      const match = label.match(/(\d+)\s+unread message/i);
-      if (match) {
-        total += parseInt(match[1], 10);
-      }
-    });
-
-    if (total > 0) return total;
-
-    // Strategy 2: visible digit-only badge spans inside chat rows (language-independent)
-    rows.forEach(row => {
-      for (const span of row.querySelectorAll('span')) {
-        const text = (span.textContent || '').trim();
-        if (!/^\d+$/.test(text)) continue;
-        const num = parseInt(text, 10);
-        if (num <= 0 || num > 9999) continue;
-        if (seen.has(span)) continue;
-        const rect = span.getBoundingClientRect();
-        if (rect.width < 1 || rect.height < 1 || rect.width > 60) continue;
-        seen.add(span);
-        total += num;
-        break; // one badge per row
-      }
-    });
-
-    return total;
-  }
-
-  function getUnreadCount() {
-    // WhatsApp title shows chat count ("(3) WhatsApp"), not message count.
-    // getDomCount() sums aria-label "N unread messages" per row — the correct metric.
-    return getDomCount();
-  }
-
-  function checkAndUpdate() {
-    try {
-      const count = getUnreadCount();
-      if (count !== lastCount) {
-        lastCount = count;
-        invokeTauri(count);
-      }
-    } catch (e) {
-      console.error('[Signalist Inject] WhatsApp unread check error:', e);
-    }
-  }
-
-  function debouncedCheckAndUpdate() {
-    clearTimeout(_debounceTimer);
-    const now = Date.now();
-    const elapsed = now - _lastFireTime;
-
-    if (elapsed >= MAX_DELAY_MS) {
-      // Max delay exceeded — fire immediately
-      checkAndUpdate();
-      _lastFireTime = Date.now();
-    } else {
-      const delay = Math.min(DEBOUNCE_MS, MAX_DELAY_MS - elapsed);
-      _debounceTimer = setTimeout(() => {
-        checkAndUpdate();
-        _lastFireTime = Date.now();
-      }, delay);
-    }
-  }
-
-  function setupObservers() {
-    // 1. Observe <title> for SPA title changes.
-    const titleEl = document.querySelector('title');
-    if (titleEl) {
-      new MutationObserver(debouncedCheckAndUpdate).observe(titleEl, {
-        childList: true,
-      });
-    }
-
-    // 2. Observe side-panel / chat-list containers.
-    function observeChatList() {
-      const containers = [
-        document.querySelector('#pane-side'),
-        document.querySelector('#side'),
-        document.querySelector('[aria-label="Chat list"]'),
-      ];
-
-      // Attach to the first container we find — these selectors often match
-      // overlapping nodes (e.g. #pane-side contains #side); attaching to all
-      // would create redundant observers that double-trigger callbacks.
-      const target = containers.find(Boolean);
-      if (!target) return false;
-      new MutationObserver(debouncedCheckAndUpdate).observe(target, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ['aria-label', 'class'],
-        characterData: true,
-      });
-      console.log('[Signalist Inject] whatsapp observer attached');
-      return true;
-    }
-
-    if (!observeChatList()) {
-      const fallback = new MutationObserver(() => {
-        if (observeChatList()) {
-          fallback.disconnect();
-        }
-      });
-      fallback.observe(document.body, { childList: true, subtree: true });
-    }
-
-    // Safety net: re-check every 5s regardless of mutations — debounce coalesces rapid calls
-    setInterval(debouncedCheckAndUpdate, 5000);
-
-    // Observe <html> class/style for in-app theme changes.
-    try {
-      new MutationObserver(detectAndReportTheme).observe(document.documentElement, {
-        attributes: true,
-        attributeFilter: ['class', 'style', 'data-color-scheme'],
-      });
-    } catch (e) {
-      /* ignore */
-    }
-  }
-
-  // --- Fetch patch (Tauri #15216 workaround) ---
-  // Strict CSPs on web.whatsapp.com block fetch("ipc://...") at a level that
-  // never propagates into JS rejection handlers, so Tauri's fetch-first IPC
-  // hangs forever and never falls back to window.ipc.postMessage.
-  // Intercepting fetch and immediately rejecting ipc:// URLs forces Tauri's
-  // own fallback path (postMessage), which works reliably through the CSP.
-  // Triple-layer patch: window.fetch assignment + Object.defineProperty + globalThis.fetch
-  (function patchFetch() {
-    const _origFetch = window.fetch.bind(window);
-    const patched = function(url) {
-      let urlStr = '';
-      try {
-        if (typeof url === 'string') urlStr = url;
-        else if (url instanceof URL) urlStr = url.href;
-        else if (url && typeof url.url === 'string') urlStr = url.url; // Request
-      } catch (_e) {}
-      if (urlStr.indexOf('ipc://') === 0 || urlStr.indexOf('http://ipc.localhost') === 0) {
-        return Promise.reject(new TypeError('[Signalist] fetch(ipc://) forced-reject (Tauri #15216 workaround)'));
-      }
-      return _origFetch.apply(this, arguments);
-    };
-    try { window.fetch = patched; } catch (_e) {}
-    try { Object.defineProperty(window, 'fetch', { value: patched, writable: true, configurable: true }); } catch (_e) {}
-    try { globalThis.fetch = patched; } catch (_e) {}
-    console.log('[Signalist Inject] ' + MESSENGER + ' fetch() patched (Tauri #15216 workaround)');
-  })();
-
-  console.log('[Signalist Inject] ' + MESSENGER + '.js loaded, TAURI_INTERNALS at load:', !!window.__TAURI_INTERNALS__);
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-      setupObservers();
-      setTimeout(checkAndUpdate, 1000);
-      setTimeout(debouncedCheckAndUpdate, 3000);
-      setTimeout(detectAndReportTheme, 2000);
-    });
-  } else {
-    setupObservers();
-    setTimeout(checkAndUpdate, 1000);
-    setTimeout(debouncedCheckAndUpdate, 3000);
-    setTimeout(detectAndReportTheme, 2000);
-  }
-})();
+signalistInit({
+  messenger: 'whatsapp',
+  getUnreadCount: getUnreadCount,
+  // Hosts that belong to WhatsApp itself — navigation to these stays inside the webview.
+  internalHostRe: /(^|\.)(whatsapp\.com|whatsapp\.net)$/i,
+  chatListSelectors: ['#pane-side', '#side', '[aria-label="Chat list"]'],
+  chatListAttributeFilter: ['aria-label', 'class'],
+  observeBodyClass: false,
+  initialCheckDelayMs: 1000,
+  observeThemeChanges: true,
+});

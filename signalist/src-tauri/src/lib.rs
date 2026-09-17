@@ -32,6 +32,23 @@ const SETTINGS_STORE: &str = "settings.json";
 // transient mid-sync spike that the sidebar later overwrites.
 const NOTIFY_DEBOUNCE_MS: u64 = 800;
 
+/// Builds a webview's initialization script from `inject/common.js` plus the
+/// per-view file, wrapped in one outer IIFE. The two halves therefore share a
+/// single lexical scope — neither needs to hang anything on `window`, where the
+/// embedded third-party page could see it. Both files are `include_str!`-ed at
+/// compile time, so a missing one is a build error.
+macro_rules! inject_script {
+    ($file:literal) => {
+        concat!(
+            "(function () {\n'use strict';\n",
+            include_str!("../inject/common.js"),
+            "\n",
+            include_str!($file),
+            "\n})();\n"
+        )
+    };
+}
+
 const CHROME_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -1144,8 +1161,8 @@ async fn ensure_messenger_webview(
     let parsed_url: tauri::Url = config.url.parse().map_err(|e| format!("{}", e))?;
 
     let init_script = match config.label {
-        "telegram" => include_str!("../inject/telegram.js"),
-        "whatsapp" => include_str!("../inject/whatsapp.js"),
+        "telegram" => inject_script!("../inject/telegram.js"),
+        "whatsapp" => inject_script!("../inject/whatsapp.js"),
         _ => "",
     };
 
@@ -1608,7 +1625,7 @@ async fn ensure_custom_webview(
     let window = app.get_window("main").ok_or("Main window not found")?;
     let logical = get_logical_size(&window)?;
 
-    let inject = include_str!("../inject/shortcut.js");
+    let inject = inject_script!("../inject/shortcut.js");
 
     let webview_builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed_url))
         .user_agent(safari_user_agent())

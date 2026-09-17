@@ -1,5 +1,8 @@
-// Injected into custom shortcut webviews. Reports the page's theme to the
-// sidebar and nothing else.
+// Shortcut-specific half of the inject script, concatenated after
+// `inject/common.js` inside one IIFE by `inject_script!` in lib.rs. A custom
+// shortcut reports the page's theme and fixes external file drags — no unread
+// counts, and no link interception: a shortcut is a whole site, so its links
+// stay inside the webview.
 //
 // This script deliberately contains NO anti-bot patches. It used to spoof
 // `navigator.webdriver`, `window.chrome.runtime`, `navigator.languages` and
@@ -10,88 +13,26 @@
 // Cloudflare Turnstile rejected the result ("Verification failed"), which broke
 // email login on Linear and every other site behind Turnstile. A plain
 // WKWebView with an honest Safari UA passes these checks on its own.
-(() => {
-  // WKWebView on macOS hides an external drag's DataTransfer metadata until
-  // `drop`. GitHub, GitLab and many drop-zone libraries inspect `types` during
-  // `dragenter`/`dragover`; when it is empty they reject the drag before the
-  // later event can expose its files. Preserve real metadata when WebKit
-  // provides it, and advertise the only relevant missing type while hovering.
-  function exposeExternalFileDrag(event) {
-    const transfer = event.dataTransfer;
-    if (!transfer || transfer.types.length || transfer.files.length) return;
-    try {
-      Object.defineProperty(transfer, 'types', {
-        configurable: true,
-        value: ['Files'],
-      });
-    } catch (_e) {}
-  }
 
-  document.addEventListener('dragenter', exposeExternalFileDrag, true);
-  document.addEventListener('dragover', exposeExternalFileDrag, true);
+// WKWebView on macOS hides an external drag's DataTransfer metadata until
+// `drop`. GitHub, GitLab and many drop-zone libraries inspect `types` during
+// `dragenter`/`dragover`; when it is empty they reject the drag before the
+// later event can expose its files. Preserve real metadata when WebKit
+// provides it, and advertise the only relevant missing type while hovering.
+function exposeExternalFileDrag(event) {
+  const transfer = event.dataTransfer;
+  if (!transfer || transfer.types.length || transfer.files.length) return;
+  try {
+    Object.defineProperty(transfer, 'types', {
+      configurable: true,
+      value: ['Files'],
+    });
+  } catch (_e) {}
+}
 
-  // --- Theme detection ---
-  function resolveInvoke() {
-    if (window.__TAURI_INTERNALS__ && typeof window.__TAURI_INTERNALS__.invoke === 'function') {
-      return window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__);
-    }
-    if (window.__TAURI__) {
-      if (window.__TAURI__.core && typeof window.__TAURI__.core.invoke === 'function') {
-        return window.__TAURI__.core.invoke.bind(window.__TAURI__.core);
-      }
-      if (typeof window.__TAURI__.invoke === 'function') {
-        return window.__TAURI__.invoke.bind(window.__TAURI__);
-      }
-    }
-    return null;
-  }
+document.addEventListener('dragenter', exposeExternalFileDrag, true);
+document.addEventListener('dragover', exposeExternalFileDrag, true);
 
-  function detectAndReportTheme() {
-    const invoke = resolveInvoke();
-    if (!invoke) return;
-    const bg = getComputedStyle(document.documentElement).backgroundColor;
-    const m = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-    if (!m) return;
-    const lum = (0.299 * +m[1] + 0.587 * +m[2] + 0.114 * +m[3]) / 255;
-    const p = invoke('update_sidebar_theme_from_webview', { isDark: lum < 0.5 });
-    if (p && typeof p.then === 'function') p.then(function(){}, function(){});
-  }
-
-  document.addEventListener('visibilitychange', function() {
-    if (!document.hidden) detectAndReportTheme();
-  });
-
-  setTimeout(detectAndReportTheme, 2000);
-
-  // --- Fetch patch (Tauri #15216 workaround) ---
-  // Same problem the messenger scripts hit, and for the same reason: a strict
-  // site CSP (Linear's `connect-src` is a typical one) blocks fetch("ipc://…")
-  // at a level that never reaches a JS rejection handler, so Tauri's fetch-first
-  // IPC hangs instead of falling back to window.ipc.postMessage. Rejecting those
-  // URLs ourselves forces the fallback, which the CSP doesn't touch.
-  //
-  // Note what this does *not* cover: Tauri prepends plugin init scripts to the
-  // ones set on the builder (manager/webview.rs, "Prepend all_initialization_
-  // scripts"), and the notification plugin calls `is_permission_granted` inside
-  // its own IIFE — so that one call is already in flight before this patch runs
-  // and still logs a CSP violation. Tauri falls back on its own there; the patch
-  // covers every call after it, ours and the page's alike.
-  (function patchFetch() {
-    const _origFetch = window.fetch.bind(window);
-    const patched = function(url) {
-      let urlStr = '';
-      try {
-        if (typeof url === 'string') urlStr = url;
-        else if (url instanceof URL) urlStr = url.href;
-        else if (url && typeof url.url === 'string') urlStr = url.url; // Request
-      } catch (_e) {}
-      if (urlStr.indexOf('ipc://') === 0 || urlStr.indexOf('http://ipc.localhost') === 0) {
-        return Promise.reject(new TypeError('[Signalist] fetch(ipc://) forced-reject (Tauri #15216 workaround)'));
-      }
-      return _origFetch.apply(this, arguments);
-    };
-    try { window.fetch = patched; } catch (_e) {}
-    try { Object.defineProperty(window, 'fetch', { value: patched, writable: true, configurable: true }); } catch (_e) {}
-    try { globalThis.fetch = patched; } catch (_e) {}
-  })();
-})();
+signalistInit({
+  observeThemeChanges: false,
+});
