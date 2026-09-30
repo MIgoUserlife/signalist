@@ -14,12 +14,12 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tauri::{AppHandle, Emitter, EventTarget, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry};
+use tauri::{AppHandle, Emitter, EventTarget, Manager, State, WindowEvent, Wry};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 use tauri_plugin_store::{Store, StoreExt};
 
 use crate::{
-    apply_silence_mode, ensure_custom_webview, ensure_messenger_webview, is_safe_shortcut_id,
+    apply_silence_mode, dialog_window, ensure_custom_webview, ensure_messenger_webview, is_safe_shortcut_id,
     open_add_messenger_window, open_add_shortcut_window, open_edit_shortcut_window,
     register_toggle_shortcut, ActiveMessenger, CustomShortcuts, HotkeyConfig, ShortcutId,
     SilenceMode, StoredId, UnreadCounts, UserMessengers, MESSENGERS, SETTINGS_STORE,
@@ -612,13 +612,9 @@ pub async fn open_hotkeys_window(app: AppHandle) -> Result<(), String> {
         let _ = win.set_focus();
         return Ok(());
     }
-    let win = WebviewWindowBuilder::new(&app, "hotkeys", WebviewUrl::App("index.html?view=hotkeys".into()))
-        .title("Hotkeys")
-        .inner_size(440.0, 640.0)
+    let win = dialog_window(&app, "hotkeys", "index.html?view=hotkeys".into(), "Hotkeys", 440.0, 640.0)
         .min_inner_size(400.0, 480.0)
         .resizable(true)
-        .devtools(cfg!(debug_assertions))
-        .center()
         .build()
         .map_err(|e| e.to_string())?;
     // A window closed mid-recording never sends the resume.
@@ -638,18 +634,9 @@ pub async fn open_cheatsheet_window(app: AppHandle) -> Result<(), String> {
         let _ = win.close();
         return Ok(());
     }
-    WebviewWindowBuilder::new(
-        &app,
-        "hotkey-cheatsheet",
-        WebviewUrl::App("index.html?view=hotkey-cheatsheet".into()),
-    )
-    .title("Hotkey Cheatsheet")
-    .inner_size(380.0, 600.0)
+    dialog_window(&app, "hotkey-cheatsheet", "index.html?view=hotkey-cheatsheet".into(), "Hotkey Cheatsheet", 380.0, 600.0)
     .min_inner_size(340.0, 400.0)
     .resizable(true)
-    .always_on_top(true)
-    .devtools(cfg!(debug_assertions))
-    .center()
     .build()
     .map_err(|e| e.to_string())?;
     Ok(())

@@ -1516,23 +1516,67 @@ fn get_active_messenger(app: AppHandle) -> Result<String, String> {
     Ok(active.clone())
 }
 
+/// Common setup for the app's own dialog windows (add/edit shortcut, add
+/// messenger, confirm delete, bug report, hotkeys, cheatsheet).
+///
+/// They float above every other app's windows, and open centred over the
+/// main window rather than via `center()`, which always picks the primary
+/// display — with Signalist on an external monitor the dialog would appear on
+/// the laptop screen instead.
+fn dialog_window<'a>(
+    app: &'a AppHandle,
+    label: &str,
+    url: String,
+    title: &str,
+    width: f64,
+    height: f64,
+) -> WebviewWindowBuilder<'a, tauri::Wry, AppHandle> {
+    let builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
+        .title(title)
+        .inner_size(width, height)
+        .always_on_top(true)
+        .devtools(cfg!(debug_assertions));
+    match dialog_position(app, width, height) {
+        Some((x, y)) => builder.position(x, y),
+        None => builder.center(),
+    }
+}
+
+/// Logical top-left that centres a `width`×`height` dialog over the main
+/// window, kept inside that window's display. `None` when the main window is
+/// hidden or minimized — there is nothing to centre over.
+fn dialog_position(app: &AppHandle, width: f64, height: f64) -> Option<(f64, f64)> {
+    let main = app.get_window("main")?;
+    if !main.is_visible().ok()? || main.is_minimized().ok()? {
+        return None;
+    }
+    // Physical units are per display; converting each value by its own scale
+    // factor gives the global logical coordinates `position` expects.
+    let scale = main.scale_factor().ok()?;
+    let pos = main.outer_position().ok()?.to_logical::<f64>(scale);
+    let size = main.outer_size().ok()?.to_logical::<f64>(scale);
+    let mut x = pos.x + (size.width - width) / 2.0;
+    let mut y = pos.y + (size.height - height) / 2.0;
+    if let Some(monitor) = main.current_monitor().ok().flatten() {
+        let area = monitor.work_area();
+        let m_scale = monitor.scale_factor();
+        let m_pos = area.position.to_logical::<f64>(m_scale);
+        let m_size = area.size.to_logical::<f64>(m_scale);
+        x = x.min(m_pos.x + m_size.width - width).max(m_pos.x);
+        y = y.min(m_pos.y + m_size.height - height).max(m_pos.y);
+    }
+    Some((x, y))
+}
+
 #[tauri::command]
 async fn open_add_shortcut_window(app: AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("add-shortcut") {
         let _ = win.set_focus();
         return Ok(());
     }
-    WebviewWindowBuilder::new(
-        &app,
-        "add-shortcut",
-        WebviewUrl::App("index.html?view=add-shortcut".into()),
-    )
-    .title("Add Web Shortcut")
-    .inner_size(360.0, 560.0)
+    dialog_window(&app, "add-shortcut", "index.html?view=add-shortcut".into(), "Add Web Shortcut", 360.0, 560.0)
     .min_inner_size(360.0, 560.0)
     .resizable(false)
-    .devtools(cfg!(debug_assertions))
-    .center()
     .build()
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1545,17 +1589,9 @@ async fn open_edit_shortcut_window(app: AppHandle, id: ShortcutId) -> Result<(),
         return Ok(());
     }
     let url = format!("index.html?view=edit-shortcut&id={}", id);
-    WebviewWindowBuilder::new(
-        &app,
-        "edit-shortcut",
-        WebviewUrl::App(url.into()),
-    )
-    .title("Edit Web Shortcut")
-    .inner_size(360.0, 490.0)
+    dialog_window(&app, "edit-shortcut", url, "Edit Web Shortcut", 360.0, 490.0)
     .min_inner_size(360.0, 490.0)
     .resizable(false)
-    .devtools(cfg!(debug_assertions))
-    .center()
     .build()
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1589,14 +1625,10 @@ async fn open_confirm_delete_window(app: AppHandle, kind: String, id: StoredId) 
         kind,
         encode_query_value(id.as_str())
     );
-    WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
-        .title(if kind == "shortcut" { "Delete Shortcut" } else { "Delete Messenger" })
-        .inner_size(380.0, 190.0)
+    let title = if kind == "shortcut" { "Delete Shortcut" } else { "Delete Messenger" };
+    dialog_window(&app, &label, url, title, 380.0, 190.0)
         .min_inner_size(380.0, 190.0)
         .resizable(false)
-        .always_on_top(true)
-        .devtools(cfg!(debug_assertions))
-        .center()
         .build()
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -1793,17 +1825,9 @@ async fn open_add_messenger_window(app: AppHandle) -> Result<(), String> {
         let _ = win.set_focus();
         return Ok(());
     }
-    WebviewWindowBuilder::new(
-        &app,
-        "add-messenger",
-        WebviewUrl::App("index.html?view=add-messenger".into()),
-    )
-    .title("Add Messenger")
-    .inner_size(480.0, 640.0)
+    dialog_window(&app, "add-messenger", "index.html?view=add-messenger".into(), "Add Messenger", 480.0, 640.0)
     .min_inner_size(480.0, 420.0)
     .resizable(true)
-    .devtools(cfg!(debug_assertions))
-    .center()
     .build()
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1833,17 +1857,9 @@ async fn open_bug_report_window(app: AppHandle) -> Result<(), String> {
         let _ = win.set_focus();
         return Ok(());
     }
-    WebviewWindowBuilder::new(
-        &app,
-        "bug-report",
-        WebviewUrl::App("index.html?view=bug-report".into()),
-    )
-    .title("Bug Report")
-    .inner_size(560.0, 420.0)
+    dialog_window(&app, "bug-report", "index.html?view=bug-report".into(), "Bug Report", 560.0, 420.0)
     .min_inner_size(400.0, 320.0)
     .resizable(true)
-    .devtools(cfg!(debug_assertions))
-    .center()
     .build()
     .map_err(|e| e.to_string())?;
     Ok(())
