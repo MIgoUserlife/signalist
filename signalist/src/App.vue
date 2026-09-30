@@ -26,6 +26,8 @@ const isEditDialogView = _view === "edit-shortcut";
 const isAddMessengerView = _view === "add-messenger";
 const isBugReportView = _view === "bug-report";
 const isConfirmDeleteView = _view === "confirm-delete";
+const isHotkeysView = _view === "hotkeys";
+const isCheatsheetView = _view === "hotkey-cheatsheet";
 const editShortcutId = _params.get("id") ?? "";
 const confirmDeleteId = _params.get("id") ?? "";
 const confirmDeleteKind = _params.get("kind") === "messenger" ? "messenger" : "shortcut";
@@ -34,7 +36,7 @@ const confirmDeleteKind = _params.get("kind") === "messenger" ? "messenger" : "s
 // production builds. Drives the DEV badge that flags this as the dev instance.
 const isDev = import.meta.env.DEV;
 
-if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportView && !isConfirmDeleteView) {
+if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportView && !isConfirmDeleteView && !isHotkeysView && !isCheatsheetView) {
   document.documentElement.classList.add('sidebar-view');
 }
 
@@ -136,9 +138,15 @@ const unreadCounts = reactive<Record<string, number>>(
   Object.fromEntries(messengers.map(m => [m.label, 0]))
 );
 
-const currentHotkey = ref("Super+Shift+S");
-const isRecordingHotkey = ref(false);
-const hotkeyError = ref("");
+// 1-based position in sidebar order (built-ins, user messengers, shortcuts) —
+// the same order `hotkeys.rs` uses for the "go to item N" hotkeys. Only 1–9
+// have a hotkey, so only those get a number.
+function sidebarNumber(zone: "builtin" | "user" | "shortcut", index: number): string {
+  let n = index + 1;
+  if (zone !== "builtin") n += messengers.length;
+  if (zone === "shortcut") n += userMessengers.value.length;
+  return n <= 9 ? String(n) : "";
+}
 
 const autostartEnabled = ref(false);
 const silenceEnabled = ref(false);
@@ -296,62 +304,6 @@ function shortcutLabel(id: string): string {
   return `custom-${id}`;
 }
 
-function formatHotkeyDisplay(hotkey: string): string {
-  return hotkey
-    .split("+")
-    .map((part) => {
-      switch (part) {
-        case "Super": return "⌘";
-        case "Shift": return "⇧";
-        case "Alt": return "⌥";
-        case "Control": return "⌃";
-        case "Space": return "␣";
-        default: return part;
-      }
-    })
-    .join("");
-}
-
-// `{ once: true }` is re-armed on every bare modifier, so nothing removed the
-// listener when the user simply walked away from recording: the next keystroke
-// with a modifier — anywhere in the sidebar — was swallowed and silently
-// rebound the global hotkey. Recording now always unwinds through stopRecordingHotkey().
-function stopRecordingHotkey() {
-  isRecordingHotkey.value = false;
-  window.removeEventListener("keydown", captureHotkey);
-}
-
-function captureHotkey(e: KeyboardEvent) {
-  e.preventDefault();
-  e.stopPropagation();
-  if (e.key === "Escape") {
-    stopRecordingHotkey();
-    return;
-  }
-  const mods: string[] = [];
-  if (e.metaKey) mods.push("Super");
-  if (e.ctrlKey) mods.push("Control");
-  if (e.altKey) mods.push("Alt");
-  if (e.shiftKey) mods.push("Shift");
-  if (["Meta", "Control", "Alt", "Shift"].includes(e.key)) {
-    return;
-  }
-  if (mods.length === 0) {
-    stopRecordingHotkey();
-    return;
-  }
-  const key = e.key === " " ? "Space" : e.key.length === 1 ? e.key.toUpperCase() : e.key;
-  stopRecordingHotkey();
-  saveHotkey([...mods, key].join("+"));
-}
-
-function startRecordingHotkey() {
-  if (isRecordingHotkey.value) return;
-  isRecordingHotkey.value = true;
-  hotkeyError.value = "";
-  window.addEventListener("keydown", captureHotkey);
-}
-
 async function installUpdate() {
   isInstalling.value = true;
   try {
@@ -378,15 +330,273 @@ async function toggleBoolSetting(command: string, state: Ref<boolean>, label: st
 const toggleAutostart = () => toggleBoolSetting("set_autostart", autostartEnabled, "autostart");
 const toggleSilence   = () => toggleBoolSetting("set_silence_mode", silenceEnabled, "silence mode");
 
-async function saveHotkey(shortcut: string) {
-  isRecordingHotkey.value = false;
+// ── Hotkeys (editor window + cheatsheet window) ────────────────────────────
+// The backend owns the action list and validation (`hotkeys.rs`); these views
+// only render it and send back a whole keymap. In-app hotkeys are menu key
+// equivalents, so they reach Signalist even while a messenger page has focus.
+interface HotkeyAction {
+  id: string;
+  label: string;
+  defaultKey: string;
+}
+
+interface Keymap {
+  modifiers: string[];
+  keys: Record<string, string>;
+}
+
+interface HotkeysView {
+  keymap: Keymap;
+  defaultKeymap: Keymap;
+  actions: HotkeyAction[];
+  globalHotkey: string;
+  entries: string[];
+}
+
+// No ⇧: the backend refuses it in the super key (see `MODIFIER_ORDER` in hotkeys.rs).
+const MODIFIERS = [
+  { name: "Ctrl",  symbol: "⌃", title: "Control" },
+  { name: "Alt",   symbol: "⌥", title: "Option" },
+  { name: "Cmd",   symbol: "⌘", title: "Command" },
+] as const;
+
+const hotkeys = ref<HotkeysView | null>(null);
+const hotkeysError = ref("");
+const hotkeysNotice = ref("");
+// Action id being recorded, or "global" for the show/hide hotkey.
+const recordingAction = ref<string | null>(null);
+
+// Physical key → the key name the backend stores. `KeyboardEvent.key` is
+// useless here: with ⌥ held macOS reports the composed character (⌥1 → "¡"),
+// and a Ukrainian layout reports Cyrillic letters.
+const PUNCTUATION_CODES: Record<string, string> = {
+  BracketLeft: "[", BracketRight: "]", Comma: ",", Period: ".", Slash: "/",
+  Semicolon: ";", Quote: "'", Minus: "-", Equal: "=", Backquote: "`", Backslash: "\\",
+};
+
+function keyFromCode(code: string): string | null {
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3);
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+  return PUNCTUATION_CODES[code] ?? null;
+}
+
+// The global hotkey may also use keys a menu item cannot: global-hotkey takes
+// these names as the `KeyboardEvent.code` spells them.
+const GLOBAL_ONLY_CODES = /^(F([1-9]|1[0-9]|2[0-4])|Arrow(Up|Down|Left|Right)|Space|Enter|Tab|Home|End|PageUp|PageDown)$/;
+
+function globalKeyFromCode(code: string): string | null {
+  return GLOBAL_ONLY_CODES.test(code) ? code : keyFromCode(code);
+}
+
+function formatModifiers(mods: string[]): string {
+  return MODIFIERS.filter(m => mods.includes(m.name)).map(m => m.symbol).join("");
+}
+
+function formatActionCombo(actionId: string): string {
+  const key = hotkeys.value?.keymap.keys[actionId];
+  if (!hotkeys.value || !key) return "—";
+  return formatModifiers(hotkeys.value.keymap.modifiers) + key;
+}
+
+// The global hotkey keeps the global-shortcut plugin's spelling (`Super+Shift+S`).
+function formatHotkeyDisplay(hotkey: string): string {
+  return hotkey
+    .split("+")
+    .map((part) => {
+      switch (part) {
+        case "Super": return "⌘";
+        case "ArrowUp": return "↑";
+        case "ArrowDown": return "↓";
+        case "ArrowLeft": return "←";
+        case "ArrowRight": return "→";
+        case "Enter": return "↩";
+        case "Tab": return "⇥";
+        case "Shift": return "⇧";
+        case "Alt": return "⌥";
+        case "Control": return "⌃";
+        case "Space": return "␣";
+        default: return part;
+      }
+    })
+    .join("");
+}
+
+function actionTitle(a: HotkeyAction): string {
+  const m = /^goto-(\d)$/.exec(a.id);
+  if (!m || !hotkeys.value) return a.label;
+  const name = hotkeys.value.entries[Number(m[1]) - 1];
+  return name ? `Go to ${m[1]} · ${name}` : `Go to ${m[1]} · (empty)`;
+}
+
+// Combinations something else takes first: macOS itself, or an item of the
+// standard menu that sits next to ours. Canonical order ⌃⌥⌘, as the backend stores.
+const RESERVED_COMBOS: Record<string, string> = {
+  "Ctrl+Cmd+Q": "macOS Lock Screen", "Alt+Cmd+D": "macOS Dock hiding",
+  "Cmd+`": "macOS window cycling",
+  "Cmd+Q": "Quit", "Cmd+H": "Hide", "Alt+Cmd+H": "Hide Others", "Cmd+W": "Close Window",
+  "Cmd+M": "Minimize", "Ctrl+Cmd+F": "Full Screen",
+  "Cmd+Z": "Undo", "Cmd+X": "Cut", "Cmd+C": "Copy",
+  "Cmd+V": "Paste", "Cmd+A": "Select All",
+};
+
+function reservedFor(actionId: string): string | null {
+  const key = hotkeys.value?.keymap.keys[actionId];
+  if (!hotkeys.value || !key) return null;
+  return RESERVED_COMBOS[[...hotkeys.value.keymap.modifiers, key].join("+")] ?? null;
+}
+
+function flash(target: Ref<string>, message: string) {
+  target.value = message;
+  setTimeout(() => { if (target.value === message) target.value = ""; }, 4000);
+}
+
+async function loadHotkeys() {
+  try {
+    hotkeys.value = await invoke<HotkeysView>("get_hotkeys");
+  } catch (e) {
+    hotkeysError.value = `Failed to load hotkeys: ${String(e)}`;
+  }
+}
+
+// Edits are queued and each one is built from the keymap the previous save
+// returned. Built at click time instead, two quick edits would both start from
+// the same keymap and the second would silently undo the first.
+let keymapSaves: Promise<void> = Promise.resolve();
+
+function saveKeymap(edit: (view: HotkeysView) => { keymap: Keymap; notice?: string }) {
+  keymapSaves = keymapSaves.then(async () => {
+    if (!hotkeys.value) return;
+    // Everything inside the try: a throw escaping this callback would leave
+    // `keymapSaves` rejected, and every later edit would be skipped silently.
+    try {
+      const { keymap, notice } = edit(hotkeys.value);
+      hotkeys.value.keymap = await invoke<Keymap>("set_keymap", { keymap });
+      hotkeysError.value = "";
+      if (notice) flash(hotkeysNotice, notice);
+    } catch (e) {
+      flash(hotkeysError, String(e));
+    }
+  });
+}
+
+function toggleModifier(name: string) {
+  saveKeymap(({ keymap }) => {
+    const current = keymap.modifiers;
+    const modifiers = current.includes(name) ? current.filter(m => m !== name) : [...current, name];
+    return { keymap: { ...keymap, modifiers } };
+  });
+}
+
+function bindKey(actionId: string, key: string) {
+  saveKeymap(({ keymap, actions }) => {
+    const keys = { ...keymap.keys };
+    // A key already in use moves here instead of being refused: rebinding is
+    // the common intent, and the notice says which action lost it.
+    const previousOwner = key
+      ? actions.find(a => a.id !== actionId && keys[a.id] === key)
+      : undefined;
+    if (previousOwner) keys[previousOwner.id] = "";
+    keys[actionId] = key;
+    return {
+      keymap: { ...keymap, keys },
+      notice: previousOwner ? `Unbound from "${actionTitle(previousOwner)}"` : "",
+    };
+  });
+}
+
+function resetAllHotkeys() {
+  // Not structuredClone: `defaultKeymap` is a reactive proxy, which it refuses.
+  saveKeymap(({ defaultKeymap }) => ({
+    keymap: { modifiers: [...defaultKeymap.modifiers], keys: { ...defaultKeymap.keys } },
+    notice: "Restored defaults",
+  }));
+}
+
+async function saveGlobalHotkey(shortcut: string) {
+  if (!hotkeys.value) return;
   try {
     await invoke("set_global_shortcut", { shortcut });
-    currentHotkey.value = shortcut;
-  } catch {
-    hotkeyError.value = "Failed to register";
-    setTimeout(() => { hotkeyError.value = ""; }, 2000);
+    hotkeys.value.globalHotkey = shortcut;
+    hotkeysError.value = "";
+  } catch (e) {
+    flash(hotkeysError, `Failed to register: ${String(e)}`);
   }
+}
+
+// One listener serves every recorder in the window; stopRecording() is the
+// only way out, so it cannot outlive the recording the way the old sidebar
+// recorder once did.
+//
+// While recording, the backend drops the menu key equivalents and the global
+// hotkey: both are resolved before this window sees the keystroke, so a bound
+// combination would run its action instead of being recorded. The returned
+// promise settles once they are back, so a save that follows sees them.
+function stopRecording(): Promise<unknown> {
+  window.removeEventListener("keydown", captureKey, true);
+  if (recordingAction.value === null) return Promise.resolve();
+  recordingAction.value = null;
+  return invoke("suspend_hotkeys", { suspend: false }).catch(e => console.warn("Failed to restore hotkeys:", e));
+}
+
+async function startRecording(actionId: string) {
+  if (recordingAction.value === actionId) {
+    stopRecording();
+    return;
+  }
+  await stopRecording();
+  recordingAction.value = actionId;
+  hotkeysError.value = "";
+  window.addEventListener("keydown", captureKey, true);
+  invoke("suspend_hotkeys", { suspend: true }).catch(e => console.warn("Failed to suspend hotkeys:", e));
+}
+
+function captureKey(e: KeyboardEvent) {
+  const actionId = recordingAction.value;
+  if (!actionId) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.key === "Escape") {
+    stopRecording();
+    return;
+  }
+  if (["Meta", "Control", "Alt", "Shift"].includes(e.key)) return;
+
+  if (actionId === "global") {
+    const mods: string[] = [];
+    if (e.metaKey) mods.push("Super");
+    if (e.ctrlKey) mods.push("Control");
+    if (e.altKey) mods.push("Alt");
+    if (e.shiftKey) mods.push("Shift");
+    const key = globalKeyFromCode(e.code);
+    if (mods.length === 0 || !key) {
+      flash(hotkeysError, "Use at least one modifier and a letter, digit, punctuation, F-key, arrow or Space");
+      return;
+    }
+    stopRecording().then(() => saveGlobalHotkey([...mods, key].join("+")));
+    return;
+  }
+
+  // In-app actions record the key alone; the super modifier is shared.
+  if (e.key === "Backspace" || e.key === "Delete") {
+    stopRecording();
+    bindKey(actionId, "");
+    return;
+  }
+  const key = keyFromCode(e.code);
+  if (!key) {
+    flash(hotkeysError, "Only letters, digits and punctuation keys can be bound");
+    return;
+  }
+  stopRecording();
+  bindKey(actionId, key);
+}
+
+function onCheatsheetKeydown(e: KeyboardEvent) {
+  if (e.key === "Escape") closeDialogWindow();
+}
+
+if (isCheatsheetView) {
+  window.addEventListener("keydown", onCheatsheetKeydown);
 }
 
 async function loadCustomShortcuts() {
@@ -717,18 +927,20 @@ onMounted(async () => {
     return;
   }
 
+  if (isHotkeysView || isCheatsheetView) {
+    // The keymap, the global hotkey and the sidebar names can change while
+    // either window is open (the cheatsheet stays on top of the editor).
+    await listen("hotkeys-changed", () => loadHotkeys());
+    await loadHotkeys();
+    return;
+  }
+
   try {
     if (!(await isPermissionGranted())) {
       await requestPermission();
     }
   } catch (e) {
     console.warn("Notification permission request failed:", e);
-  }
-
-  try {
-    currentHotkey.value = await invoke<string>("get_global_shortcut");
-  } catch (e) {
-    console.warn("Failed to load hotkey:", e);
   }
 
   try {
@@ -772,6 +984,9 @@ onMounted(async () => {
       } catch (e) {
         console.error("Failed to remove item:", e);
       }
+    }),
+    await listen<boolean>("silence-changed", (event) => {
+      silenceEnabled.value = event.payload;
     }),
     await listen<boolean>("theme-update", (event) => {
       autoIsDark.value = event.payload;
@@ -829,7 +1044,8 @@ onUnmounted(() => {
   unlisteners.forEach(fn => fn());
   downloadCleanupTimers.forEach(timer => clearTimeout(timer));
   downloadCleanupTimers.clear();
-  stopRecordingHotkey();
+  stopRecording();
+  window.removeEventListener("keydown", onCheatsheetKeydown);
   document.removeEventListener("click", onDocumentClick);
 });
 
@@ -947,6 +1163,126 @@ async function switchMessenger(label: string) {
         @click="closeDialogWindow()"
       >Done</button>
     </div>
+  </div>
+
+  <!-- ── Hotkeys editor view ──────────────────────────────────────────────── -->
+  <div
+    v-else-if="isHotkeysView"
+    class="h-screen flex flex-col bg-surface p-5 gap-4 select-none"
+  >
+    <h2 class="text-text-primary text-base font-semibold leading-none">Hotkeys</h2>
+
+    <template v-if="hotkeys">
+      <div class="flex flex-col gap-2">
+        <h3 class="text-text-primary text-xs font-semibold uppercase tracking-wide opacity-70">Super key</h3>
+        <div class="flex items-center gap-2">
+          <button
+            v-for="m in MODIFIERS"
+            :key="m.name"
+            :class="[
+              'h-9 w-9 rounded-lg text-base cursor-pointer transition-colors border',
+              hotkeys.keymap.modifiers.includes(m.name)
+                ? 'border-accent text-accent bg-surface-hover'
+                : 'border-glass-border text-text-muted hover:bg-surface-hover',
+            ]"
+            :title="m.title"
+            @click="toggleModifier(m.name)"
+          >{{ m.symbol }}</button>
+        </div>
+        <p class="text-[11px] text-text-muted leading-relaxed">
+          Every in-app hotkey is this modifier plus one key. They work while Signalist is the active app.
+        </p>
+      </div>
+
+      <div class="w-full border-t border-glass-border" />
+
+      <div class="flex flex-col gap-1 min-h-0 flex-1 overflow-y-auto">
+        <h3 class="text-text-primary text-xs font-semibold uppercase tracking-wide opacity-70 mb-1">Global</h3>
+        <div class="flex items-center gap-3 px-2 py-1 rounded-lg">
+          <span class="text-sm text-text-primary flex-1">Show / hide window <span class="text-[11px] text-text-muted">— from any app</span></span>
+          <button
+            :class="[
+              'min-w-16 px-2 h-7 rounded-md text-sm font-mono cursor-pointer transition-colors border',
+              recordingAction === 'global'
+                ? 'border-accent text-accent animate-pulse'
+                : 'border-glass-border text-text-primary hover:bg-surface-hover',
+            ]"
+            title="Click, then press a key combination (Esc to cancel)"
+            @click="startRecording('global')"
+          >{{ recordingAction === 'global' ? '···' : formatHotkeyDisplay(hotkeys.globalHotkey) }}</button>
+        </div>
+
+        <h3 class="text-text-primary text-xs font-semibold uppercase tracking-wide opacity-70 mt-3 mb-1">In app</h3>
+        <div
+          v-for="a in hotkeys.actions"
+          :key="a.id"
+          class="flex items-center gap-3 px-2 py-1 rounded-lg hover:bg-surface-hover"
+        >
+          <div class="flex flex-col flex-1 min-w-0">
+            <span class="text-sm text-text-primary truncate">{{ actionTitle(a) }}</span>
+            <span v-if="reservedFor(a.id)" class="text-[10px] text-red-400">Taken by {{ reservedFor(a.id) }}</span>
+          </div>
+          <button
+            v-if="hotkeys.keymap.keys[a.id] !== a.defaultKey"
+            class="text-[11px] text-text-muted hover:text-text-primary cursor-pointer"
+            :title="`Reset to ${formatModifiers(hotkeys.keymap.modifiers)}${a.defaultKey}`"
+            @click="bindKey(a.id, a.defaultKey)"
+          >↺</button>
+          <button
+            :class="[
+              'min-w-16 px-2 h-7 rounded-md text-sm font-mono cursor-pointer transition-colors border',
+              recordingAction === a.id
+                ? 'border-accent text-accent animate-pulse'
+                : 'border-glass-border text-text-primary hover:bg-surface',
+            ]"
+            title="Click, then press a key (Backspace to unbind, Esc to cancel)"
+            @click="startRecording(a.id)"
+          >{{ recordingAction === a.id ? '···' : formatActionCombo(a.id) }}</button>
+        </div>
+      </div>
+    </template>
+
+    <p v-if="hotkeysError" class="text-[11px] text-red-400">{{ hotkeysError }}</p>
+    <p v-else-if="hotkeysNotice" class="text-[11px] text-text-muted">{{ hotkeysNotice }}</p>
+
+    <div class="flex items-center justify-between">
+      <button
+        class="px-3 py-2 rounded-lg text-[12px] text-text-muted hover:bg-surface-hover cursor-pointer transition-colors"
+        @click="resetAllHotkeys"
+      >Reset to defaults</button>
+      <button
+        class="px-4 py-2 rounded-lg text-sm text-text-muted hover:bg-surface-hover cursor-pointer transition-colors"
+        @click="closeDialogWindow()"
+      >Done</button>
+    </div>
+  </div>
+
+  <!-- ── Hotkey cheatsheet view ───────────────────────────────────────────── -->
+  <div
+    v-else-if="isCheatsheetView"
+    class="h-screen flex flex-col bg-surface p-5 gap-3 select-none"
+  >
+    <h2 class="text-text-primary text-base font-semibold leading-none">Hotkeys</h2>
+    <p v-if="hotkeysError" class="text-[11px] text-red-400">{{ hotkeysError }}</p>
+    <div v-if="hotkeys" class="flex flex-col gap-0.5 min-h-0 flex-1 overflow-y-auto">
+      <div class="flex items-center gap-3 px-2 py-1">
+        <span class="text-sm text-text-primary flex-1">Show / hide window</span>
+        <span class="text-sm font-mono text-accent">{{ formatHotkeyDisplay(hotkeys.globalHotkey) }}</span>
+      </div>
+      <div class="w-full border-t border-glass-border my-1" />
+      <template v-for="a in hotkeys.actions" :key="a.id">
+        <div
+          v-if="hotkeys.keymap.keys[a.id] && !(a.id.startsWith('goto-') && !hotkeys.entries[Number(a.id.slice(5)) - 1])"
+          class="flex items-center gap-3 px-2 py-1"
+        >
+          <span class="text-sm text-text-primary flex-1 truncate">{{ actionTitle(a) }}</span>
+          <span class="text-sm font-mono text-accent">{{ formatActionCombo(a.id) }}</span>
+        </div>
+      </template>
+    </div>
+    <p class="text-[10px] text-text-muted opacity-60">
+      Sidebar numbers mark items 1–9 · Esc to close · Change in Hotkey settings
+    </p>
   </div>
 
   <!-- ── Bug Report view ──────────────────────────────────────────────────── -->
@@ -1179,7 +1515,7 @@ async function switchMessenger(label: string) {
 
       <!-- Zone 2: Built-in messengers -->
       <div class="flex w-full flex-col items-center gap-1 px-2 pt-3">
-        <div v-for="m in messengers" :key="m.label" class="relative">
+        <div v-for="(m, i) in messengers" :key="m.label" class="relative">
           <button
             :class="[
               'group flex h-10 w-10 items-center justify-center rounded-xl border-none cursor-pointer transition-all duration-150',
@@ -1192,6 +1528,10 @@ async function switchMessenger(label: string) {
           >
             <span class="flex h-5 w-5 items-center justify-center [&>svg]:h-5 [&>svg]:w-5" v-html="m.icon" />
           </button>
+          <span
+            v-if="sidebarNumber('builtin', i)"
+            class="pointer-events-none absolute top-0.5 left-1 text-[9px] leading-none text-text-muted opacity-50 select-none"
+          >{{ sidebarNumber('builtin', i) }}</span>
 
           <span
             v-if="unreadCounts[m.label] > 0"
@@ -1205,7 +1545,7 @@ async function switchMessenger(label: string) {
       <!-- Zone 2.5: User Messengers + Add Messenger button -->
       <div class="flex w-full flex-col items-center gap-1 px-2 pt-3">
         <div
-          v-for="m in userMessengers"
+          v-for="(m, i) in userMessengers"
           :key="m.id"
           class="relative group"
         >
@@ -1222,6 +1562,10 @@ async function switchMessenger(label: string) {
             <span v-if="m.icon && iconMap[m.icon]" class="flex h-5 w-5 [&>svg]:h-5 [&>svg]:w-5" v-html="iconMap[m.icon]" />
             <template v-else>{{ shortcutInitial(m.name) }}</template>
           </button>
+          <span
+            v-if="sidebarNumber('user', i)"
+            class="pointer-events-none absolute top-0.5 left-1 text-[9px] leading-none text-text-muted opacity-50 select-none"
+          >{{ sidebarNumber('user', i) }}</span>
           <button
             class="absolute -top-1 -right-1 hidden group-hover:flex items-center justify-center h-5 w-5 p-0 rounded-full bg-surface text-text-muted hover:bg-badge-bg hover:text-white text-sm line-height cursor-pointer"
             title="Remove"
@@ -1271,6 +1615,10 @@ async function switchMessenger(label: string) {
             <span v-if="sc.icon && iconMap[sc.icon]" class="flex h-5 w-5 [&>svg]:h-5 [&>svg]:w-5" v-html="iconMap[sc.icon]" />
             <template v-else>{{ shortcutInitial(sc.name) }}</template>
           </button>
+          <span
+            v-if="sidebarNumber('shortcut', i)"
+            class="pointer-events-none absolute top-0.5 left-1 text-[9px] leading-none text-text-muted opacity-50 select-none"
+          >{{ sidebarNumber('shortcut', i) }}</span>
           <button
             class="absolute -top-1 -right-1 hidden group-hover:flex items-center justify-center h-5 w-5 p-0 rounded-full bg-surface text-text-muted hover:bg-badge-bg hover:text-white text-sm line-height cursor-pointer"
             title="Remove"
@@ -1399,18 +1747,13 @@ async function switchMessenger(label: string) {
                 </span>
               </button>
 
-              <span v-if="hotkeyError" class="text-[8px] text-red-400 leading-none text-center px-1">{{ hotkeyError }}</span>
-
               <button
-                class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150"
-                :class="isRecordingHotkey ? 'text-accent bg-surface-hover animate-pulse' : 'text-text-muted hover:bg-surface-hover hover:text-text-primary'"
-                :title="isRecordingHotkey ? 'Press key combination (Esc to cancel)' : `Global hotkey: ${currentHotkey} — click to change`"
-                @click="isRecordingHotkey ? null : startRecordingHotkey()"
+                class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150 text-text-muted hover:bg-surface-hover hover:text-text-primary"
+                title="Hotkeys — global show/hide, super key and in-app bindings"
+                @click="invoke('open_hotkeys_window')"
               >
                 <span class="text-base leading-none select-none">⌨</span>
-                <span class="text-[9px] leading-none opacity-70 select-none font-medium">
-                  {{ isRecordingHotkey ? '···' : formatHotkeyDisplay(currentHotkey) }}
-                </span>
+                <span class="text-[9px] leading-none opacity-70 select-none font-medium">KEYS</span>
               </button>
 
               <!-- Theme mode button -->

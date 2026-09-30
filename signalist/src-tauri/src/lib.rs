@@ -22,6 +22,8 @@ use tauri_plugin_store::StoreExt;
 #[cfg(target_os = "macos")]
 use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
 
+mod hotkeys;
+
 const SIDEBAR_WIDTH: f64 = 64.0;
 
 const SETTINGS_STORE: &str = "settings.json";
@@ -1639,6 +1641,7 @@ fn update_custom_shortcut(
 
     persist_custom_shortcuts(&app)?;
     update_tray(&app);
+    hotkeys::refresh_menu(&app);
     emit_to_sidebar(&app, "shortcut-updated", updated.clone());
     Ok(updated)
 }
@@ -1660,6 +1663,7 @@ fn add_custom_shortcut(app: AppHandle, name: String, url: String, icon: Option<S
     app.state::<CustomShortcuts>().0.lock().unwrap().push(sc.clone());
     persist_custom_shortcuts(&app)?;
     update_tray(&app);
+    hotkeys::refresh_menu(&app);
     emit_to_sidebar(&app, "shortcut-added", sc.clone());
     Ok(sc)
 }
@@ -1692,6 +1696,7 @@ fn reorder_custom_shortcuts(app: AppHandle, ids: Vec<StoredId>) -> Result<Vec<Cu
 
     persist_custom_shortcuts(&app)?;
     update_tray(&app);
+    hotkeys::refresh_menu(&app);
     Ok(reordered)
 }
 
@@ -1701,6 +1706,7 @@ fn remove_custom_shortcut(app: AppHandle, id: StoredId) -> Result<(), String> {
     app.state::<CustomShortcuts>().0.lock().unwrap().retain(|sc| sc.id != id);
     persist_custom_shortcuts(&app)?;
     update_tray(&app);
+    hotkeys::refresh_menu(&app);
     Ok(())
 }
 
@@ -1732,6 +1738,7 @@ fn add_user_messenger(
     app.state::<UserMessengers>().0.lock().unwrap().push(m.clone());
     persist_user_messengers(&app)?;
     update_tray(&app);
+    hotkeys::refresh_menu(&app);
     Ok(m)
 }
 
@@ -1776,6 +1783,7 @@ fn remove_user_messenger(app: AppHandle, id: StoredId) -> Result<(), String> {
     app.state::<UserMessengers>().0.lock().unwrap().retain(|m| m.id != id);
     persist_user_messengers(&app)?;
     update_tray(&app);
+    hotkeys::refresh_menu(&app);
     Ok(())
 }
 
@@ -2045,21 +2053,26 @@ fn get_silence_mode(state: State<SilenceMode>) -> bool {
 }
 
 #[tauri::command]
-fn set_silence_mode(app: AppHandle, state: State<SilenceMode>, enable: bool) -> Result<(), String> {
+fn set_silence_mode(app: AppHandle, enable: bool) -> Result<(), String> {
+    apply_silence_mode(&app, enable)
+}
+
+/// Shared by the sidebar button and the silence hotkey. The event keeps the
+/// sidebar button in sync when the change came from the menu; the menu item is
+/// retitled because its title names the state it would switch to.
+fn apply_silence_mode(app: &AppHandle, enable: bool) -> Result<(), String> {
     {
+        let state = app.state::<SilenceMode>();
         let mut v = state.0.lock().unwrap();
         if *v == enable { return Ok(()); }
         *v = enable;
     }
+    emit_to_sidebar(app, "silence-changed", enable);
+    hotkeys::update_silence_item(app, enable);
     let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
     store.set("silence_mode", enable);
     store.save().map_err(|e| e.to_string())?;
     Ok(())
-}
-
-#[tauri::command]
-fn get_global_shortcut(state: State<HotkeyConfig>) -> String {
-    state.0.lock().unwrap().clone()
 }
 
 #[tauri::command]
@@ -2068,6 +2081,7 @@ fn set_global_shortcut(
     state: State<HotkeyConfig>,
     shortcut: String,
 ) -> Result<(), String> {
+    hotkeys::check_global_hotkey(&app, &shortcut)?;
     let old = state.0.lock().unwrap().clone();
     if !old.is_empty() {
         let _ = app.global_shortcut().unregister(old.as_str());
@@ -2086,6 +2100,7 @@ fn set_global_shortcut(
     store.set("hotkey", serde_json::Value::String(shortcut));
     store.save().map_err(|e| e.to_string())?;
     update_tray(&app);
+    hotkeys::notify_hotkey_views(&app);
     Ok(())
 }
 
@@ -2258,6 +2273,8 @@ pub fn run() {
         .manage(CustomShortcuts(Mutex::new(Vec::new())))
         .manage(UserMessengers(Mutex::new(Vec::new())))
         .manage(BuiltinPreload::default())
+        .manage(hotkeys::KeymapState(Mutex::new(hotkeys::Keymap::default())))
+        .manage(hotkeys::MenuState::default())
         .invoke_handler(tauri::generate_handler![
             open_messenger,
             switch_messenger,
@@ -2267,7 +2284,6 @@ pub fn run() {
             update_unread_count,
             get_silence_mode,
             set_silence_mode,
-            get_global_shortcut,
             set_global_shortcut,
             get_autostart,
             set_autostart,
@@ -2293,6 +2309,11 @@ pub fn run() {
             open_bug_report_window,
             open_in_browser,
             show_window,
+            hotkeys::get_hotkeys,
+            hotkeys::set_keymap,
+            hotkeys::open_hotkeys_window,
+            hotkeys::open_cheatsheet_window,
+            hotkeys::suspend_hotkeys,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -2361,6 +2382,12 @@ pub fn run() {
                 .unwrap_or_default();
             *app.state::<BuiltinPreload>().0.lock().unwrap() = saved_builtin_preload;
 
+            *app.state::<hotkeys::KeymapState>().0.lock().unwrap() = hotkeys::load_keymap(&store, &saved_hotkey);
+            // After the lists and the keymap are in state: the menu names the
+            // sidebar items and carries the in-app hotkeys.
+            hotkeys::refresh_menu(app.handle());
+            app.on_menu_event(hotkeys::handle_menu_event);
+
             // After the store is loaded, so the preload set reflects saved flags.
             spawn_startup_preload(handle.clone());
 
@@ -2393,39 +2420,10 @@ pub fn run() {
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| {
                     match event.id.as_ref() {
-                        id @ ("telegram" | "whatsapp") => {
-                            if let Some(window) = app.get_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                            let messenger = id.to_string();
-                            let app_clone = app.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let _ = open_messenger(app_clone, messenger).await;
-                            });
-                        }
-                        id if id.starts_with("custom-") => {
-                            if let Some(window) = app.get_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                            let id_str = id.to_string();
-                            let shortcut_match = app.state::<CustomShortcuts>().0.lock().unwrap()
-                                .iter()
-                                .find(|s| s.webview_label() == id_str)
-                                .map(|sc| (sc.id.clone(), sc.url.clone()));
-                            let user_match = app.try_state::<UserMessengers>().and_then(|state| {
-                                state.0.lock().unwrap()
-                                    .iter()
-                                    .find(|m| m.webview_label() == id_str)
-                                    .map(|m| (m.id.clone(), m.url.clone()))
-                            });
-                            if let Some((entry_id, entry_url)) = shortcut_match.or(user_match) {
-                                let app_clone = app.clone();
-                                tauri::async_runtime::spawn(async move {
-                                    let _ = open_custom_shortcut(app_clone, entry_id, entry_url).await;
-                                });
-                            }
+                        // Sidebar items are keyed by webview label, the
+                        // same way the Navigate hotkeys resolve them.
+                        id if MESSENGERS.iter().any(|m| m.label == id) || id.starts_with("custom-") => {
+                            hotkeys::activate_label(app, id);
                         }
                         "toggle_window" => toggle_window(app),
                         "toggle_dock" => do_toggle_dock_icon(app),
