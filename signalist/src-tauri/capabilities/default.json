@@ -2,8 +2,8 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default permissions for Signalist main window and sidebar webview",
-  "windows": ["main", "add-shortcut", "edit-shortcut", "add-messenger", "bug-report", "confirm-delete-*", "hotkeys", "hotkey-cheatsheet"],
-  "webviews": ["sidebar", "add-shortcut", "edit-shortcut", "add-messenger", "bug-report", "confirm-delete-*", "hotkeys", "hotkey-cheatsheet"],
+  "windows": ["main", "add-shortcut", "edit-shortcut", "add-messenger", "bug-report", "confirm-delete-*", "hotkeys", "hotkey-cheatsheet", "cache"],
+  "webviews": ["sidebar", "add-shortcut", "edit-shortcut", "add-messenger", "bug-report", "confirm-delete-*", "hotkeys", "hotkey-cheatsheet", "cache"],
   "permissions": [
     "core:default",
     "core:window:default",

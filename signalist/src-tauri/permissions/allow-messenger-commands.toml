@@ -40,4 +40,8 @@ commands.allow = [
   "open_hotkeys_window",
   "open_cheatsheet_window",
   "suspend_hotkeys",
+  "get_cache_info",
+  "set_cache_limit",
+  "clear_caches_now",
+  "open_cache_window",
 ]

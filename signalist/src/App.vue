@@ -28,6 +28,7 @@ const isBugReportView = _view === "bug-report";
 const isConfirmDeleteView = _view === "confirm-delete";
 const isHotkeysView = _view === "hotkeys";
 const isCheatsheetView = _view === "hotkey-cheatsheet";
+const isCacheView = _view === "cache";
 const editShortcutId = _params.get("id") ?? "";
 const confirmDeleteId = _params.get("id") ?? "";
 const confirmDeleteKind = _params.get("kind") === "messenger" ? "messenger" : "shortcut";
@@ -36,7 +37,7 @@ const confirmDeleteKind = _params.get("kind") === "messenger" ? "messenger" : "s
 // production builds. Drives the DEV badge that flags this as the dev instance.
 const isDev = import.meta.env.DEV;
 
-if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportView && !isConfirmDeleteView && !isHotkeysView && !isCheatsheetView) {
+if (!isDialogView && !isEditDialogView && !isAddMessengerView && !isBugReportView && !isConfirmDeleteView && !isHotkeysView && !isCheatsheetView && !isCacheView) {
   document.documentElement.classList.add('sidebar-view');
 }
 
@@ -889,7 +890,87 @@ function openGithubIssue() {
   );
 }
 
+// ── Cache window (size limit + manual clear) ───────────────────────────────
+// The backend (`cache.rs`) measures each data store's web cache and clears any
+// store over the limit in the background; this view shows the sizes, edits the
+// limit and clears everything on demand.
+interface CacheEntryInfo { id: string; name: string; bytes: number; }
+interface CacheInfo { limitMb: number; minLimitMb: number; maxLimitMb: number; entries: CacheEntryInfo[]; }
+const cacheInfo = ref<CacheInfo | null>(null);
+// Text, not a number: `<input type="number">` follows the system locale, so
+// with a comma-decimal locale (Ukrainian) WebKit rejected "0.5" and Vue's
+// `.number` could not parse "0,5" — nothing below 1 GB could be entered.
+const cacheLimitGb = ref("1");
+const cacheStatus = ref("");
+const cacheError = ref("");
+const cacheClearing = ref(false);
+const cacheEntriesShown = computed(() => cacheInfo.value?.entries.filter(e => e.bytes > 0) ?? []);
+const cacheTotal = computed(() => cacheEntriesShown.value.reduce((sum, e) => sum + e.bytes, 0));
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  if (bytes >= 1024 ** 2) return `${Math.round(bytes / 1024 ** 2)} MB`;
+  return bytes > 0 ? "<1 MB" : "0 MB";
+}
+
+function overCacheLimit(bytes: number): boolean {
+  return !!cacheInfo.value && bytes > cacheInfo.value.limitMb * 1024 * 1024;
+}
+
+// `resetLimitField` is false on a refresh after Clear now: the field may hold
+// an edit the user has not saved yet, and overwriting it would silently undo it.
+async function loadCacheInfo(resetLimitField = true) {
+  try {
+    cacheInfo.value = await invoke<CacheInfo>("get_cache_info");
+    if (resetLimitField) {
+      cacheLimitGb.value = String(Math.round((cacheInfo.value.limitMb / 1024) * 100) / 100);
+    }
+    cacheError.value = "";
+  } catch (e) {
+    cacheError.value = `Failed to read cache sizes: ${e}`;
+  }
+}
+
+async function saveCacheLimit() {
+  if (!cacheInfo.value) return;
+  const text = cacheLimitGb.value.trim().replace(",", ".");
+  const limitMb = /^\d+(\.\d+)?$/.test(text) ? Math.round(Number(text) * 1024) : NaN;
+  const { minLimitMb, maxLimitMb } = cacheInfo.value;
+  if (!Number.isFinite(limitMb) || limitMb < minLimitMb || limitMb > maxLimitMb) {
+    const gb = (mb: number) => Math.round((mb / 1024) * 10) / 10;
+    cacheError.value = `Limit must be between ${gb(minLimitMb)} GB and ${gb(maxLimitMb)} GB`;
+    return;
+  }
+  try {
+    await invoke("set_cache_limit", { limitMb });
+    cacheInfo.value.limitMb = limitMb;
+    cacheError.value = "";
+    cacheStatus.value = "Limit saved";
+  } catch (e) {
+    cacheError.value = String(e);
+  }
+}
+
+async function clearCachesNow() {
+  cacheClearing.value = true;
+  cacheStatus.value = "";
+  try {
+    const freed = await invoke<number>("clear_caches_now");
+    cacheStatus.value = `Freed ${formatBytes(freed)}`;
+    await loadCacheInfo(false);
+  } catch (e) {
+    cacheError.value = `Failed to clear: ${e}`;
+  } finally {
+    cacheClearing.value = false;
+  }
+}
+
 onMounted(async () => {
+  if (isCacheView) {
+    await loadCacheInfo();
+    return;
+  }
+
   if (isBugReportView) {
     try { appVersion.value = await getVersion(); } catch {}
     await loadBugReportLogs();
@@ -1283,6 +1364,70 @@ async function switchMessenger(label: string) {
     <p class="text-[10px] text-text-muted opacity-60">
       Sidebar numbers mark items 1–9 · Esc to close · Change in Hotkey settings
     </p>
+  </div>
+
+  <!-- ── Cache view ───────────────────────────────────────────────────────── -->
+  <div
+    v-else-if="isCacheView"
+    class="h-screen flex flex-col bg-surface p-5 gap-3 select-none"
+  >
+    <h2 class="text-text-primary text-base font-semibold leading-none">Cache</h2>
+    <p class="text-[11px] text-text-muted leading-relaxed">
+      Media the messengers keep on disk. A large cache slows down the start of the app.
+      Clearing it keeps you signed in — images and videos load again when shown.
+    </p>
+
+    <div class="flex flex-col gap-0.5 min-h-0 flex-1 overflow-y-auto rounded-lg border border-glass-border px-1 py-1">
+      <div v-if="!cacheInfo" class="flex items-center justify-center h-full text-text-muted text-sm">Measuring…</div>
+      <template v-else>
+        <div v-for="e in cacheEntriesShown" :key="e.id" class="flex items-center gap-3 px-2 py-1">
+          <span class="text-sm text-text-primary flex-1 truncate">{{ e.name }}</span>
+          <span class="text-sm font-mono" :class="overCacheLimit(e.bytes) ? 'text-red-400' : 'text-text-muted'">{{ formatBytes(e.bytes) }}</span>
+        </div>
+        <div v-if="cacheEntriesShown.length === 0" class="px-2 py-1 text-sm text-text-muted">Nothing cached</div>
+        <div class="w-full border-t border-glass-border my-1" />
+        <div class="flex items-center gap-3 px-2 py-1">
+          <span class="text-sm text-text-primary flex-1">Total</span>
+          <span class="text-sm font-mono text-accent">{{ formatBytes(cacheTotal) }}</span>
+        </div>
+      </template>
+    </div>
+
+    <label class="flex items-center gap-2 text-sm text-text-primary">
+      <span class="flex-1">Limit per messenger</span>
+      <input
+        v-model="cacheLimitGb"
+        type="text"
+        inputmode="decimal"
+        class="w-20 rounded-lg border border-glass-border bg-surface-hover px-2 py-1 text-sm text-text-primary outline-none text-right"
+        @keydown.enter="saveCacheLimit"
+      />
+      <span class="text-text-muted">GB</span>
+      <button
+        class="px-3 py-1 rounded-lg text-sm text-text-muted hover:bg-surface-hover cursor-pointer transition-colors border border-glass-border"
+        :disabled="!cacheInfo"
+        @click="saveCacheLimit"
+      >Save</button>
+    </label>
+    <p class="text-[10px] text-text-muted opacity-60 -mt-2">
+      Checked a minute after launch and every 6 hours; a cache over the limit is cleared.
+      A shortcut's cache is cleared only while it is open in this session.
+    </p>
+
+    <p v-if="cacheError" class="text-[11px] text-red-400">{{ cacheError }}</p>
+    <p v-else-if="cacheStatus" class="text-[11px] text-accent">{{ cacheStatus }}</p>
+
+    <div class="flex gap-2">
+      <button
+        class="flex-1 px-3 py-2 rounded-lg text-sm text-text-muted hover:bg-surface-hover cursor-pointer transition-colors border border-glass-border"
+        @click="closeDialogWindow()"
+      >Close</button>
+      <button
+        class="flex-1 px-3 py-2 rounded-lg text-sm font-medium bg-accent text-surface hover:opacity-90 cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+        :disabled="cacheClearing || !cacheInfo"
+        @click="clearCachesNow"
+      >{{ cacheClearing ? 'Clearing…' : 'Clear now' }}</button>
+    </div>
   </div>
 
   <!-- ── Bug Report view ──────────────────────────────────────────────────── -->
@@ -1754,6 +1899,19 @@ async function switchMessenger(label: string) {
               >
                 <span class="text-base leading-none select-none">⌨</span>
                 <span class="text-[9px] leading-none opacity-70 select-none font-medium">KEYS</span>
+              </button>
+
+              <button
+                class="flex flex-col h-12 w-12 items-center justify-center gap-0.5 rounded-xl border-none bg-transparent cursor-pointer transition-all duration-150 text-text-muted hover:bg-surface-hover hover:text-text-primary"
+                title="Cache — size limit and manual clearing"
+                @click="invoke('open_cache_window')"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <ellipse cx="12" cy="5" rx="9" ry="3"/>
+                  <path d="M3 5v14a9 3 0 0 0 18 0V5"/>
+                  <path d="M3 12a9 3 0 0 0 18 0"/>
+                </svg>
+                <span class="text-[9px] leading-none opacity-70 select-none font-medium">CACHE</span>
               </button>
 
               <!-- Theme mode button -->

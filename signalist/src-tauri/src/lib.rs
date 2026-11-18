@@ -3,15 +3,15 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Mutex,
+    Mutex, OnceLock,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::utils::config::BackgroundThrottlingPolicy;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     path::BaseDirectory,
     tray::TrayIconBuilder,
-    webview::{DownloadEvent, NewWindowResponse, Webview, WebviewBuilder},
+    webview::{DownloadEvent, NewWindowResponse, PageLoadEvent, Webview, WebviewBuilder},
     AppHandle, Emitter, EventTarget, LogicalPosition, LogicalSize, Manager, RunEvent, Runtime,
     State, WebviewUrl, WebviewWindowBuilder, WindowBuilder, WindowEvent,
 };
@@ -22,6 +22,7 @@ use tauri_plugin_store::StoreExt;
 #[cfg(target_os = "macos")]
 use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
 
+mod cache;
 mod hotkeys;
 
 const SIDEBAR_WIDTH: f64 = 64.0;
@@ -1164,6 +1165,10 @@ fn update_unread_count(app: AppHandle, messenger: String, count: u32) {
         return;
     }
     let count = count.min(10_000);
+    startup_mark(
+        || format!("unread:{messenger}"),
+        || format!("{messenger}: first unread report from the page"),
+    );
     log::debug!("[update_unread_count] CALLED for {} with count {}", messenger, count);
 
     let Some(unread_state) = app.try_state::<UnreadCounts>() else { return };
@@ -1433,6 +1438,12 @@ async fn ensure_messenger_webview(
         .data_store_identifier(config.data_store_id)
         .on_navigation(nav_guard)
         .on_download(handle_download)
+        .on_page_load(|webview, payload| {
+            if payload.event() == PageLoadEvent::Finished {
+                let label = webview.label();
+                startup_mark(|| format!("load:{label}"), || format!("{label}: page load finished"));
+            }
+        })
         .devtools(cfg!(debug_assertions))
         // Without this, WebKit throttles timers of a hidden view and fully
         // suspends it after ~5 minutes — the inject script would stop reporting
@@ -2120,6 +2131,40 @@ fn set_global_shortcut(
     Ok(())
 }
 
+/// When `run()` started, the zero point of the startup timeline in the log.
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+/// Milestones already written to the startup timeline, so a page that reloads
+/// or a messenger that reports every few seconds logs its first time only.
+static STARTUP_MARKS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// How long after launch a milestone still counts as part of startup. A view
+/// first opened hours later is not a startup event, and logging it as
+/// `[startup +10800000 ms]` would only muddy the before/after comparison.
+const STARTUP_WINDOW: Duration = Duration::from_secs(120);
+
+/// Writes `[startup +N ms] <what>` the first time `key` is seen during startup.
+///
+/// "Telegram takes long to open" is otherwise unmeasurable after the fact: the
+/// log said only *that* a messenger was preloaded, never how long the visible
+/// one took to become usable. These lines are the before/after evidence for
+/// any startup change, read straight from the release build's log.
+///
+/// Both strings are built lazily: `update_unread_count` calls this on every
+/// report for the life of the process, and past `STARTUP_WINDOW` the call must
+/// cost no more than reading the clock.
+fn startup_mark(key: impl FnOnce() -> String, what: impl FnOnce() -> String) {
+    let Some(start) = PROCESS_START.get() else { return };
+    let elapsed = start.elapsed();
+    if elapsed > STARTUP_WINDOW {
+        return;
+    }
+    if !STARTUP_MARKS.lock().unwrap().get_or_insert_with(HashSet::new).insert(key()) {
+        return;
+    }
+    log::info!("[startup +{} ms] {}", elapsed.as_millis(), what());
+}
+
 // Gap between two preloaded webviews. Each one spawns a WebContent process and
 // pulls a full web app over the network; starting them back-to-back makes the
 // first seconds after launch noticeably janky, so they are staggered.
@@ -2157,12 +2202,16 @@ fn spawn_startup_preload(app: AppHandle) {
             .cloned()
             .unwrap_or_else(|| MESSENGERS[0].label.to_string());
 
-        if let Err(e) = tauri::async_runtime::block_on(ensure_messenger_webview(
+        match tauri::async_runtime::block_on(ensure_messenger_webview(
             app.clone(),
             active.clone(),
             true,
         )) {
-            log::error!("Failed to open {} at startup: {}", active, e);
+            Ok(_) => startup_mark(
+                || "created:visible".into(),
+                || format!("{active}: webview created (visible)"),
+            ),
+            Err(e) => log::error!("Failed to open {} at startup: {}", active, e),
         }
 
         for label in builtins.into_iter().filter(|l| *l != active) {
@@ -2256,6 +2305,7 @@ fn check_macos_version_or_exit() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = PROCESS_START.set(Instant::now());
     #[cfg(target_os = "macos")]
     check_macos_version_or_exit();
     install_panic_hook();
@@ -2289,6 +2339,7 @@ pub fn run() {
         .manage(CustomShortcuts(Mutex::new(Vec::new())))
         .manage(UserMessengers(Mutex::new(Vec::new())))
         .manage(BuiltinPreload::default())
+        .manage(cache::CacheLimit::default())
         .manage(hotkeys::KeymapState(Mutex::new(hotkeys::Keymap::default())))
         .manage(hotkeys::MenuState::default())
         .invoke_handler(tauri::generate_handler![
@@ -2330,6 +2381,10 @@ pub fn run() {
             hotkeys::open_hotkeys_window,
             hotkeys::open_cheatsheet_window,
             hotkeys::suspend_hotkeys,
+            cache::get_cache_info,
+            cache::set_cache_limit,
+            cache::clear_caches_now,
+            cache::open_cache_window,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -2398,17 +2453,22 @@ pub fn run() {
                 .unwrap_or_default();
             *app.state::<BuiltinPreload>().0.lock().unwrap() = saved_builtin_preload;
 
+            *app.state::<cache::CacheLimit>().0.lock().unwrap() = cache::load_cache_limit(&store);
+
             *app.state::<hotkeys::KeymapState>().0.lock().unwrap() = hotkeys::load_keymap(&store, &saved_hotkey);
             // After the lists and the keymap are in state: the menu names the
             // sidebar items and carries the in-app hotkeys.
             hotkeys::refresh_menu(app.handle());
             app.on_menu_event(hotkeys::handle_menu_event);
 
+            startup_mark(|| "setup".into(), || "window, sidebar and settings ready".into());
             // After the store is loaded, so the preload set reflects saved flags.
             spawn_startup_preload(handle.clone());
 
             // After the shortcut lists are in state, so the sweep knows what to keep.
             spawn_orphan_data_store_cleanup(handle.clone(), store_trusted);
+
+            cache::spawn_cache_limit_watch(handle.clone());
 
             app.handle()
                 .global_shortcut()

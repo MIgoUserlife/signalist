@@ -34,11 +34,13 @@ window-vibrancy = "0.5"
 
 # Deleting a shortcut's session is `+[WKWebsiteDataStore
 # removeDataStoreForIdentifier:completionHandler:]` (macOS 14+), so the app
-# never has to know where WebKit keeps its stores. wry already pulls these exact
-# versions in, so naming them here adds no crate to the build.
+# never has to know where WebKit keeps its stores. Clearing caches is
+# `-[WKWebsiteDataStore removeDataOfTypes:modifiedSince:]` (`cache.rs`); NSBundle
+# only names the folder whose size the cache window reports. wry already pulls
+# these exact versions in, so naming them here adds no crate to the build.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSUUID", "NSError", "NSString", "NSArray"] }
-objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "WKWebsiteDataStore"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSUUID", "NSError", "NSString", "NSArray", "NSBundle", "NSSet", "NSDate"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "WKWebsiteDataStore", "WKWebsiteDataRecord"] }
 block2 = "0.6"
 
